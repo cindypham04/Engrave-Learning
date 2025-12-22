@@ -8,6 +8,7 @@ import fitz
 import sqlite3
 from pydantic import BaseModel
 from openai import OpenAI
+from typing import Optional
 
 client = OpenAI()
 
@@ -43,6 +44,7 @@ conn.commit()
 # Define where uploaded files will be stored
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True) # create upload directory if not exists
+
 
 # Load PDF document and extract text from each page
 def extract_pages_from_pdf(document_id): 
@@ -119,45 +121,60 @@ def reshape_pages(pages):
     return details
 
 # LLM helper
-def ask_openai(question: str, context: str):
+def ask_openai(prompt_text):
     resp = client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=[
             {
                 "role": "system",
                 "content": """ 
-You are a patient and friendly tutor.
+    You are a patient and clear tutor whose goal is to build understanding step by step.
 
-Rules you must follow:
-- Use ONLY the provided document content. Do not use external knowledge.
-- If the answer is not clearly stated in the material, say:
-  "This is not specified in the material."
+    You must explain concepts using a strict progression:
+    1. Start by stating the goal or problem in plain language.
+    2. Explain why this problem exists or why it matters.
+    3. Describe how the idea or method works at a high level.
+    4. Explain how it is used when new data or situations appear.
+    5. Ground the explanation with one concrete example.
+    6. Only after the intuition is clear, introduce technical terms and define them.
 
-How to structure your answer:
-1. Start with 1-2 sentences that give a high-level, intuitive summary.
-2. Then explain in more detail using bullet points when helpful.
-   - Use simple language, as if explaining to a 12-year-old.
-   - Avoid jargon when possible. If jargon is necessary, explain it clearly.
-3. Keep the explanation concise (a 2-3 short paragraphs).
+    Rules:
+    - Each paragraph must introduce new information.
+    - Do NOT restate or paraphrase earlier sentences.
+    - Assume the reader remembers what you just explained.
+    - Avoid circular definitions.
+    - Introduce technical terms (e.g., decision boundary, distribution) only after explaining the intuition behind them.
 
-Tone:
-- Friendly, calm, encouraging.
-- End with one gentle follow-up question.
+    Style:
+    - Write as if teaching a smart student encountering the idea for the first time.
+    - Be concise but complete.
+    - Prefer cause → effect explanations.
+    - Use simple language; explain jargon only when necessary.
+
+    If the answer is not clearly supported by the provided document, say:
+    “This is not specified in the material.”
+
 """
             },
             {
                 "role": "user",
-                "content" : f"Document:\n{context}\n\nQuestion:\n{question}"
+                "content" : f"{prompt_text}"
             }
         ],
         temperature = 0.3 # how predictable vs creative the model’s answers are
     )
     return resp.choices[0].message.content
 
+# Store Context objects
+class Context(BaseModel):
+    text: str
+    page: Optional[int] = None
+
 # Store Ask Question objects
 class AskQuestion(BaseModel):
     document_id: str
     question: str
+    context: Optional[Context] = None
 
 # Get the pdf file from frontend then write it into uploads
 @app.post("/upload")
@@ -191,21 +208,54 @@ def get_file(document_id: str):
 # Get question from frontend
 @app.post("/ask")
 def ask_document(req: AskQuestion):
+
     pages = get_pages(req.document_id)
 
-    # Edge case: document not found
     if not pages:
-        return {
-            "answer": "Document not found.",
-        }
-    
-    page_context = reshape_pages(pages)
+        return {"answer": "Document not found."}
 
-    answer = ask_openai(req.question, page_context)
+    # Case 1: user provided context (selected text)
+    # Prompt format: context (selected text) -> rule -> question -> reference pages 
+    if req.context:
+        print("Context mode")
+        print("Text:", req.context.text)
 
-    return {
-        "answer": answer
-    }
+        # Get reference page number, also the previous and following pages
+        current_idx = req.context.page - 1
+
+        previous_page_context = pages[current_idx - 1]['text'] if current_idx - 1 >= 0 else ""
+        current_page_context = pages[current_idx]['text']
+        next_page_context = pages[current_idx + 1]['text'] if current_idx + 1 < len(pages) else ""
+
+        # Use context as primary signal
+        context = f"""
+        The student selected the following text from the document:
+
+        \"\"\"{req.context.text}\"\"\"
+
+        If the question uses “this”, “it”, or “that”, they refer to the highlighted text above.
+        Question: {req.question}.
+
+        Supporting document content: 
+        {current_page_context}.
+        {previous_page_context}.
+        {next_page_context}.
+        """
+
+        print("FINAL PROMPT:\n", context)
+
+        answer = ask_openai(prompt_text=context)
+
+        return {"answer": answer}
+
+    # Case 2: no context provided, use full document
+    # Prompt format: question -> whole document
+    print("Document-wise mode")
+    context = f"Answer the following question {req.question} using the following document content: {reshape_pages(pages)}"
+    answer = ask_openai(prompt_text=context)
+
+    return {"answer": answer}
+
 
 # Debug route 
 @app.get("/debug/page_count")
