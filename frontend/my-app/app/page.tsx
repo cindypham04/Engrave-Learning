@@ -30,6 +30,13 @@ type SelectionContext = {
   page: number;
 };
 
+type DragRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
 /* ---------------- Main Component ---------------- */
 
 export default function Home() {
@@ -37,10 +44,19 @@ export default function Home() {
   const [documentId, setDocumentId] = useState<string | null>(null);
   const [numPages, setNumPages] = useState(0);
 
+  // Text selection (Day 4)
   const [selection, setSelection] = useState<SelectionContext | null>(null);
   const [pendingSelection, setPendingSelection] =
     useState<SelectionContext | null>(null);
 
+  // Region selection (Day 5 - Step 1)
+  const [regionMode, setRegionMode] = useState(false);
+  const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(
+    null
+  );
+  const [dragRect, setDragRect] = useState<DragRect | null>(null);
+
+  // Chat
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -70,9 +86,11 @@ export default function Home() {
     setAnswer(null);
   }
 
-  /* ---------------- Selection logic ---------------- */
+  /* ---------------- Text selection logic (unchanged) ---------------- */
 
   useEffect(() => {
+    if (regionMode) return;
+
     function handleSelectionChange() {
       if (selection) {
         hidePopup();
@@ -114,7 +132,7 @@ export default function Home() {
     document.addEventListener("selectionchange", handleSelectionChange);
     return () =>
       document.removeEventListener("selectionchange", handleSelectionChange);
-  }, [selection]);
+  }, [selection, regionMode]);
 
   function showPopup(rect: DOMRect) {
     if (!popupRef.current) return;
@@ -159,6 +177,25 @@ export default function Home() {
       <div style={{ flex: 2, padding: "1rem", overflow: "auto" }}>
         <input type="file" accept="application/pdf" onChange={handleUpload} />
 
+        {/* Region mode toggle */}
+        <button
+          onClick={() => {
+            setRegionMode((prev) => !prev);
+            setDragRect(null);
+            setDragStart(null);
+          }}
+          style={{
+            marginLeft: "1rem",
+            padding: "6px 10px",
+            background: regionMode ? "#333" : "#eee",
+            color: regionMode ? "#fff" : "#000",
+            borderRadius: "4px",
+            cursor: "pointer",
+          }}
+        >
+          {regionMode ? "Exit Region Select" : "Select Region"}
+        </button>
+
         {pdfUrl && (
           <Document
             file={pdfUrl}
@@ -170,48 +207,111 @@ export default function Home() {
               <div
                 key={i}
                 data-page-number={i + 1}
-                style={{ marginBottom: "1.5rem" }}
+                style={{
+                  position: "relative",
+                  marginBottom: "1.5rem",
+                }}
               >
                 <Page
                   pageNumber={i + 1}
                   renderTextLayer
                   renderAnnotationLayer={false}
                 />
+
+                {/* Region selection overlay */}
+                {regionMode && (
+                  <div
+                    onMouseDown={(e) => {
+                      const rect =
+                        e.currentTarget.getBoundingClientRect();
+                      setDragStart({
+                        x: e.clientX - rect.left,
+                        y: e.clientY - rect.top,
+                      });
+                      setDragRect(null);
+                    }}
+                    onMouseMove={(e) => {
+                      if (!dragStart) return;
+
+                      const rect =
+                        e.currentTarget.getBoundingClientRect();
+                      const x = e.clientX - rect.left;
+                      const y = e.clientY - rect.top;
+
+                      setDragRect({
+                        x: Math.min(dragStart.x, x),
+                        y: Math.min(dragStart.y, y),
+                        width: Math.abs(x - dragStart.x),
+                        height: Math.abs(y - dragStart.y),
+                      });
+                    }}
+                    onMouseUp={() => {
+                      if (dragRect) {
+                        console.log(
+                          "Selected region on page",
+                          i + 1,
+                          dragRect
+                        );
+                      }
+                      setDragStart(null);
+                    }}
+                    style={{
+                      position: "absolute",
+                      inset: 0,
+                      cursor: "crosshair",
+                      zIndex: 10,
+                    }}
+                  >
+                    {dragRect && (
+                      <div
+                        style={{
+                          position: "absolute",
+                          left: dragRect.x,
+                          top: dragRect.y,
+                          width: dragRect.width,
+                          height: dragRect.height,
+                          border: "2px dashed #0070f3",
+                          background: "rgba(0, 112, 243, 0.1)",
+                          pointerEvents: "none",
+                        }}
+                      />
+                    )}
+                  </div>
+                )}
               </div>
             ))}
           </Document>
         )}
 
-        {/* Add to chat popup */}
-        <div
-          ref={popupRef}
-          onMouseDown={(e) => {
-            e.preventDefault(); // CRITICAL
-            e.stopPropagation();
+        {/* Add-to-chat popup (text mode only) */}
+        {!regionMode && (
+          <div
+            ref={popupRef}
+            onMouseDown={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
 
-            if (!pendingSelection) return;
+              if (!pendingSelection) return;
 
-            console.log("Context added:", pendingSelection);
-
-            setSelection(pendingSelection);
-            setPendingSelection(null);
-            hidePopup();
-          }}
-          style={{
-            position: "absolute",
-            display: "none",
-            background: "#111",
-            color: "#ffffffff",
-            padding: "6px 10px",
-            borderRadius: "6px",
-            cursor: "pointer",
-            zIndex: 1000,
-            fontSize: "14px",
-          }}
-        >
-          Add to chat
-        </div>
-
+              setSelection(pendingSelection);
+              setPendingSelection(null);
+              hidePopup();
+            }}
+            style={{
+              position: "absolute",
+              display: "none",
+              background: "#111",
+              color: "#fff",
+              padding: "6px 10px",
+              borderRadius: "6px",
+              cursor: "pointer",
+              zIndex: 1000,
+              fontSize: "14px",
+            }}
+          >
+            Add to chat
+          </div>
+        )}
       </div>
 
       {/* Chat Panel */}
@@ -219,7 +319,8 @@ export default function Home() {
         {selection ? (
           <div
             style={{
-              background: "#333333ff",
+              background: "#333",
+              color: "#fff",
               padding: "0.75rem",
               borderRadius: "6px",
               marginBottom: "1rem",
@@ -231,7 +332,7 @@ export default function Home() {
           </div>
         ) : (
           <p style={{ fontSize: "14px", color: "#777", marginBottom: "1rem" }}>
-            Select text from the PDF and click “Add to chat”.
+            Select text or use region mode to add context.
           </p>
         )}
 
