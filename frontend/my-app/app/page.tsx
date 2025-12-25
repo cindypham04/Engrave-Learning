@@ -25,10 +25,20 @@ const Page = dynamic(
 
 /* ---------------- Types ---------------- */
 
-type SelectionContext = {
+type TextContext = {
+  type: "text";
   text: string;
   page: number;
 };
+
+type ImageContext = {
+  type: "image";
+  region_id: string;
+  document_id: string;
+  page_number: number;
+};
+
+type Context = TextContext | ImageContext;
 
 type DragRect = {
   x: number;
@@ -44,24 +54,23 @@ export default function Home() {
   const [documentId, setDocumentId] = useState<string | null>(null);
   const [numPages, setNumPages] = useState(0);
 
-  // Text selection (Day 4)
-  const [selection, setSelection] = useState<SelectionContext | null>(null);
-  const [pendingSelection, setPendingSelection] =
-    useState<SelectionContext | null>(null);
+  const [context, setContext] = useState<Context | null>(null);
 
-  // Region selection (Day 5 - Step 1)
+  // region selection
   const [regionMode, setRegionMode] = useState(false);
   const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(
     null
   );
   const [dragRect, setDragRect] = useState<DragRect | null>(null);
+  const [activePage, setActivePage] = useState<number | null>(null);
 
-  // Chat
+  // chat
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
   const popupRef = useRef<HTMLDivElement | null>(null);
+  const pendingTextRef = useRef<TextContext | null>(null);
 
   /* ---------------- Upload PDF ---------------- */
 
@@ -80,36 +89,27 @@ export default function Home() {
 
     setPdfUrl(data.url);
     setDocumentId(data.document_id);
-    setSelection(null);
-    setPendingSelection(null);
+    setContext(null);
     setQuestion("");
     setAnswer(null);
   }
 
-  /* ---------------- Text selection logic (unchanged) ---------------- */
+  /* ---------------- Text selection ---------------- */
 
   useEffect(() => {
     if (regionMode) return;
 
     function handleSelectionChange() {
-      if (selection) {
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed) {
         hidePopup();
         return;
       }
 
-      const domSelection = window.getSelection();
-      if (!domSelection || domSelection.isCollapsed) {
-        hidePopup();
-        return;
-      }
+      const text = sel.toString().trim();
+      if (!text) return;
 
-      const text = domSelection.toString().trim();
-      if (!text) {
-        hidePopup();
-        return;
-      }
-
-      const range = domSelection.getRangeAt(0);
+      const range = sel.getRangeAt(0);
       const rect = range.getBoundingClientRect();
 
       let node: any = range.startContainer;
@@ -125,14 +125,19 @@ export default function Home() {
 
       if (!pageNum) return;
 
-      setPendingSelection({ text, page: pageNum });
+      pendingTextRef.current = {
+        type: "text",
+        text,
+        page: pageNum,
+      };
+
       showPopup(rect);
     }
 
     document.addEventListener("selectionchange", handleSelectionChange);
     return () =>
       document.removeEventListener("selectionchange", handleSelectionChange);
-  }, [selection, regionMode]);
+  }, [regionMode]);
 
   function showPopup(rect: DOMRect) {
     if (!popupRef.current) return;
@@ -146,10 +151,66 @@ export default function Home() {
     popupRef.current.style.display = "none";
   }
 
+  /* ---------------- Region upload ---------------- */
+
+  async function uploadRegion(
+    pageNumber: number,
+    rect: DragRect,
+    pageContainer: HTMLElement
+  ) {
+    if (!documentId) return;
+
+    const canvas = pageContainer.querySelector("canvas");
+    if (!canvas) return;
+
+    const scaleX = canvas.width / pageContainer.clientWidth;
+    const scaleY = canvas.height / pageContainer.clientHeight;
+
+    const cropCanvas = document.createElement("canvas");
+    cropCanvas.width = rect.width * scaleX;
+    cropCanvas.height = rect.height * scaleY;
+
+    const ctx = cropCanvas.getContext("2d")!;
+    ctx.drawImage(
+      canvas,
+      rect.x * scaleX,
+      rect.y * scaleY,
+      rect.width * scaleX,
+      rect.height * scaleY,
+      0,
+      0,
+      cropCanvas.width,
+      cropCanvas.height
+    );
+
+    const blob = await new Promise<Blob>((resolve) =>
+      cropCanvas.toBlob((b) => resolve(b!), "image/png")
+    );
+
+    const formData = new FormData();
+    formData.append("region", blob);
+    formData.append("document_id", documentId);
+    formData.append("page_number", String(pageNumber));
+
+    const res = await fetch("http://localhost:8000/upload-region", {
+      method: "POST",
+      body: formData,
+    });
+
+    const data = await res.json();
+
+    setContext({
+      type: "image",
+      region_id: data.region_id,
+      document_id: documentId!,
+      page_number: pageNumber,
+    });
+  }
+
   /* ---------------- Ask backend ---------------- */
 
   async function askQuestion() {
-    if (!documentId || !selection) return;
+    if (!documentId || !context) return;
 
     setLoading(true);
     setAnswer(null);
@@ -160,7 +221,9 @@ export default function Home() {
       body: JSON.stringify({
         document_id: documentId,
         question: question || "Explain this in simple terms.",
-        context: selection,
+        ...(context.type === "text"
+          ? { context }
+          : { region: context }),
       }),
     });
 
@@ -177,25 +240,6 @@ export default function Home() {
       <div style={{ flex: 2, padding: "1rem", overflow: "auto" }}>
         <input type="file" accept="application/pdf" onChange={handleUpload} />
 
-        {/* Region mode toggle */}
-        <button
-          onClick={() => {
-            setRegionMode((prev) => !prev);
-            setDragRect(null);
-            setDragStart(null);
-          }}
-          style={{
-            marginLeft: "1rem",
-            padding: "6px 10px",
-            background: regionMode ? "#333" : "#eee",
-            color: regionMode ? "#fff" : "#000",
-            borderRadius: "4px",
-            cursor: "pointer",
-          }}
-        >
-          {regionMode ? "Exit Region Select" : "Select Region"}
-        </button>
-
         {pdfUrl && (
           <Document
             file={pdfUrl}
@@ -207,10 +251,12 @@ export default function Home() {
               <div
                 key={i}
                 data-page-number={i + 1}
-                style={{
-                  position: "relative",
-                  marginBottom: "1.5rem",
+                onDoubleClick={() => {
+                  setRegionMode(true);
+                  setActivePage(i + 1);
+                  setDragRect(null);
                 }}
+                style={{ position: "relative", marginBottom: "1.5rem" }}
               >
                 <Page
                   pageNumber={i + 1}
@@ -218,25 +264,20 @@ export default function Home() {
                   renderAnnotationLayer={false}
                 />
 
-                {/* Region selection overlay */}
-                {regionMode && (
+                {regionMode && activePage === i + 1 && (
                   <div
                     onMouseDown={(e) => {
-                      const rect =
-                        e.currentTarget.getBoundingClientRect();
+                      const r = e.currentTarget.getBoundingClientRect();
                       setDragStart({
-                        x: e.clientX - rect.left,
-                        y: e.clientY - rect.top,
+                        x: e.clientX - r.left,
+                        y: e.clientY - r.top,
                       });
-                      setDragRect(null);
                     }}
                     onMouseMove={(e) => {
                       if (!dragStart) return;
-
-                      const rect =
-                        e.currentTarget.getBoundingClientRect();
-                      const x = e.clientX - rect.left;
-                      const y = e.clientY - rect.top;
+                      const r = e.currentTarget.getBoundingClientRect();
+                      const x = e.clientX - r.left;
+                      const y = e.clientY - r.top;
 
                       setDragRect({
                         x: Math.min(dragStart.x, x),
@@ -245,15 +286,17 @@ export default function Home() {
                         height: Math.abs(y - dragStart.y),
                       });
                     }}
-                    onMouseUp={() => {
+                    onMouseUp={async (e) => {
                       if (dragRect) {
-                        console.log(
-                          "Selected region on page",
+                        await uploadRegion(
                           i + 1,
-                          dragRect
+                          dragRect,
+                          e.currentTarget.parentElement!
                         );
                       }
+                      setRegionMode(false);
                       setDragStart(null);
+                      setDragRect(null);
                     }}
                     style={{
                       position: "absolute",
@@ -271,8 +314,7 @@ export default function Home() {
                           width: dragRect.width,
                           height: dragRect.height,
                           border: "2px dashed #0070f3",
-                          background: "rgba(0, 112, 243, 0.1)",
-                          pointerEvents: "none",
+                          background: "rgba(0,112,243,0.15)",
                         }}
                       />
                     )}
@@ -283,19 +325,15 @@ export default function Home() {
           </Document>
         )}
 
-        {/* Add-to-chat popup (text mode only) */}
         {!regionMode && (
           <div
             ref={popupRef}
-            onMouseDown={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-
-              if (!pendingSelection) return;
-
-              setSelection(pendingSelection);
-              setPendingSelection(null);
-              hidePopup();
+            onMouseDown={() => {
+              if (pendingTextRef.current) {
+                setContext(pendingTextRef.current);
+                pendingTextRef.current = null;
+                hidePopup();
+              }
             }}
             style={{
               position: "absolute",
@@ -306,7 +344,6 @@ export default function Home() {
               borderRadius: "6px",
               cursor: "pointer",
               zIndex: 1000,
-              fontSize: "14px",
             }}
           >
             Add to chat
@@ -316,26 +353,6 @@ export default function Home() {
 
       {/* Chat Panel */}
       <div style={{ flex: 1, padding: "1rem", borderLeft: "1px solid #ccc" }}>
-        {selection ? (
-          <div
-            style={{
-              background: "#333",
-              color: "#fff",
-              padding: "0.75rem",
-              borderRadius: "6px",
-              marginBottom: "1rem",
-              fontSize: "14px",
-            }}
-          >
-            <strong>Context added (page {selection.page})</strong>
-            <p style={{ marginTop: "0.5rem" }}>{selection.text}</p>
-          </div>
-        ) : (
-          <p style={{ fontSize: "14px", color: "#777", marginBottom: "1rem" }}>
-            Select text or use region mode to add context.
-          </p>
-        )}
-
         <h3>Your Question</h3>
         <textarea
           value={question}
@@ -345,7 +362,7 @@ export default function Home() {
 
         <button
           onClick={askQuestion}
-          disabled={!selection || loading}
+          disabled={!context || loading}
           style={{ marginTop: "1rem" }}
         >
           {loading ? "Thinking..." : "Ask"}
