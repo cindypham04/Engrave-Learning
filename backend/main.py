@@ -11,16 +11,10 @@ from typing import Optional
 from fastapi import HTTPException
 from dotenv import load_dotenv
 from openai import OpenAI
+import base64
 
-load_dotenv()
 
-api_key = os.getenv("OPENAI_API_KEY")
-print("OPENAI_API_KEY loaded:", bool(api_key))
-
-if not api_key:
-    raise RuntimeError("OPENAI_API_KEY is missing")
-
-client = OpenAI(api_key=api_key)
+client = OpenAI()
 
 # Initialize FastAPI app
 app = FastAPI()
@@ -162,26 +156,48 @@ system_prompt = """  You are a patient and clear tutor whose goal is to build un
 
 # Case 1: user asked about a text - call OpenAI 
 def ask_openai(prompt_text, system_prompt=system_prompt):
-    resp = client.chat.completions.create(
+    response = client.responses.create(
         model="gpt-4.1-mini",
-        messages=[
+        input=[
             {
                 "role": "system",
                 "content": system_prompt
             },
             {
                 "role": "user",
-                "content" : f"{prompt_text}"
+                "content": prompt_text
             }
         ],
-        temperature = 0.3 # how predictable vs creative the model’s answers are
+        temperature=0.3
     )
-    return resp.choices[0].message.content
+    return response.output_text
 
 # Case 2: user asked about a region image - Call OpenAI
 def ask_region(prompt_text, region_id, system_prompt=system_prompt):
-    resp = client.responses.create(
-        model="gpt-4o-mini",
+    # Resolve image path
+    png_path = os.path.join(REGION_DIR, f"{region_id}.png")
+    jpeg_path = os.path.join(REGION_DIR, f"{region_id}.jpeg")
+
+    if os.path.exists(png_path):
+        image_path = png_path
+        mime = "image/png"
+    elif os.path.exists(jpeg_path):
+        image_path = jpeg_path
+        mime = "image/jpeg"
+    else:
+        raise HTTPException(status_code=404, detail="Region image not found")
+
+    # Load image bytes
+    with open(image_path, "rb") as f:
+        img_bytes = f.read()
+
+    # Encode as Base64 and wrap as data URL
+    image_base64 = base64.b64encode(img_bytes).decode("utf-8")
+    data_url = f"data:{mime};base64,{image_base64}"
+
+    # Call OpenAI
+    response = client.responses.create(
+        model="gpt-4.1-mini",
         input=[
             {
                 "role": "system",
@@ -193,7 +209,7 @@ def ask_region(prompt_text, region_id, system_prompt=system_prompt):
                     {"type": "input_text", "text": prompt_text},
                     {
                         "type": "input_image",
-                        "image_url": f"http://localhost:8000/regions/{region_id}"
+                        "image_url": data_url
                     }
                 ]
             }
@@ -201,8 +217,7 @@ def ask_region(prompt_text, region_id, system_prompt=system_prompt):
         temperature=0.3
     )
 
-    return resp.output_text
-
+    return response.output_text
 
 
 # Store Context objects
