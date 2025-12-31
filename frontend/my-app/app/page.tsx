@@ -4,6 +4,12 @@ import { useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import "react-pdf/dist/Page/TextLayer.css";
 
+const ChatMessage = dynamic(
+  () => import("../../components/ChatMessage"),
+  { ssr: false }
+);
+
+
 /* ---------------- react-pdf (client only) ---------------- */
 
 const Document = dynamic(
@@ -371,7 +377,7 @@ export default function Home() {
         {answer && (
           <>
             <h3 style={{ marginTop: "1.5rem" }}>Answer</h3>
-            <p>{answer}</p>
+            <ChatMessage content={answer} />
           </>
         )}
       </div>

@@ -5,6 +5,11 @@
   --foreground: #171717;
 }
 
+/* Prevent KaTeX from duplicating symbols on copy-paste */
+.katex-mathml {
+  display: none;
+}
+
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
