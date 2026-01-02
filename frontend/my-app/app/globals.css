@@ -22,4 +22,7 @@
 body {
   background: var(--background);
   color: var(--foreground);
+  font-family: Calibri, "Segoe UI", Candara, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 25px;
 }

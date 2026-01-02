@@ -5,7 +5,6 @@ import shutil
 from fastapi.responses import FileResponse
 import uuid
 import fitz
-import sqlite3
 from pydantic import BaseModel
 from typing import Optional
 from fastapi import HTTPException
@@ -13,6 +12,8 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import base64
 import re
+from db import save_pages, get_pages, get_page_count
+from db import get_messages, save_message
 
 # load_dotenv()  # Load OpenAI API key from .env file
 
@@ -33,22 +34,6 @@ app.add_middleware(
     allow_headers=["*"],
 ) 
 
-# Initialize SQLite database connection
-DB_PATH = "data.db"
-
-conn = sqlite3.connect(DB_PATH, check_same_thread=False) # conn is the database connection
-cursor = conn.cursor() # cursor is used to execute SQL commands
-
-# Create the table
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS pages (
-    document_id TEXT,
-    page_number INTEGER,
-    text TEXT,
-    PRIMARY KEY (document_id, page_number)
-)
-""")
-conn.commit()
 
 # Define where uploaded files will be stored
 UPLOAD_DIR = "uploads/documents"
@@ -79,46 +64,6 @@ def extract_pages_from_pdf(document_id):
 
     return pdf_cache
 
-# Save extracted page to SQLite
-def save_pages(pages):
-    for page in pages: 
-        cursor.execute(
-            """
-            INSERT OR REPLACE INTO pages (document_id, page_number, text)
-            VALUES (?, ?, ?)
-            """,
-            (
-                page["document_id"],
-                page["page_number"],
-                page["text"]
-            )
-        )
-    conn.commit()
-
-# Get pages from SQLite by document_id 
-def get_pages(document_id):
-    cursor.execute(
-        """
-        SELECT page_number, text 
-        FROM pages
-        WHERE document_id = ?
-        ORDER BY page_number ASC
-        """,
-        (document_id,)
-    )
-
-    # fetch all pages from the document
-    rows = cursor.fetchall()
-
-    pages = []
-
-    for row in rows:
-        pages.append({
-            "page_number": row[0],
-            "text": row[1]
-        })
-
-    return pages
 
 # Change shape of context: from [{"page_number":..., "text":...}] to "[page_number] text..."
 def reshape_pages(pages):
@@ -185,6 +130,7 @@ Identify the underlying question the student is really asking.
 
 Do NOT include meta sentences such as: "Let's break down...", "We'll explain...", "Step by step..."
 
+Every paragraph MUST contain at most 2 sentences. If more explanation is needed, split into multiple parts.
 
 2. Separate intuition from formalism
 
@@ -289,6 +235,16 @@ Every paragraph MUST contain at most 2 sentences. If more explanation is needed,
 When explaining steps after a phrase like
   "Let's unpack this piece by piece",
   you MUST use a numbered list or bullet points.
+
+Give answer in less than 250 words.
+
+Use bullet points as many as possible. 
+For example, instead of saying: 
+"There are two main types of regression: interpolation and extrapolation. Interpolation means predicting values inside the range of your known data, while extrapolation means guessing values outside that range."
+You can say: 
+"There are two main types of regression: 
+- Interpolation: predicting values inside the range of your known data
+- Extrapolation: guessing values outside that range."
 
 Your success is measured by whether the student could re-explain the idea in their own words after reading your response.
 """
@@ -444,6 +400,14 @@ def ask_document(req: AskQuestion):
 
     if not pages:
         return {"answer": "Document not found."}
+    
+    if req.question.strip():
+        save_message(
+            req.document_id,
+            "user",
+            req.question
+        )
+
 
     # Case 1: user provided context (selected text)
     # Prompt format: context (selected text) -> rule -> question -> reference pages 
@@ -477,6 +441,12 @@ def ask_document(req: AskQuestion):
 
         answer = ask_openai(prompt_text=context)
         answer = normalize_math(answer)
+
+        save_message(
+            req.document_id,
+            "assistant",
+            answer
+        )
 
         return {"answer": answer}
 
@@ -518,6 +488,12 @@ def ask_document(req: AskQuestion):
         answer = ask_region(prompt_text=region_context, region_id=req.region.region_id)
         answer = normalize_math(answer)
 
+        save_message(
+            req.document_id,
+            "assistant",
+            answer
+        )
+
         return {"answer": answer}
 
 
@@ -527,6 +503,12 @@ def ask_document(req: AskQuestion):
     context = f"Answer the following question {req.question} using the following document content: {reshape_pages(pages)}"
     answer = ask_openai(prompt_text=context)
     answer = normalize_math(answer)
+
+    save_message(
+        req.document_id,
+        "assistant",
+        answer
+    )
 
     return {"answer": answer}
 
@@ -548,12 +530,15 @@ def get_region(region_id: str):
         detail=f"Region image {region_id} not found."
     )
 
+@app.get("/chat/{document_id}")
+def get_chat(document_id: str):
+    return {"messages": get_messages(document_id)}
+
 # Debug route 
 @app.get("/debug/page_count")
 def debug_page_count():
-    cursor.execute("SELECT COUNT(*) FROM pages")
-    count = cursor.fetchone()[0]
-    return {"page_count": count}
+    return {"page_count": get_page_count()}
+
 
 # Debug route - load OpenAI
 @app.get("/debug/responses")

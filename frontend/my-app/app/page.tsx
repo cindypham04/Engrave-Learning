@@ -3,12 +3,12 @@
 import { useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import "react-pdf/dist/Page/TextLayer.css";
+import "react-pdf/dist/Page/AnnotationLayer.css";
 
 const ChatMessage = dynamic(
   () => import("../../components/ChatMessage"),
   { ssr: false }
 );
-
 
 /* ---------------- react-pdf (client only) ---------------- */
 
@@ -53,6 +53,11 @@ type DragRect = {
   height: number;
 };
 
+type ChatMsg = {
+  role: "user" | "assistant";
+  content: string;
+};
+
 /* ---------------- Main Component ---------------- */
 
 export default function Home() {
@@ -64,19 +69,29 @@ export default function Home() {
 
   // region selection
   const [regionMode, setRegionMode] = useState(false);
-  const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(
-    null
-  );
+  const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
   const [dragRect, setDragRect] = useState<DragRect | null>(null);
   const [activePage, setActivePage] = useState<number | null>(null);
 
   // chat
   const [question, setQuestion] = useState("");
-  const [answer, setAnswer] = useState<string | null>(null);
+  const [messages, setMessages] = useState<ChatMsg[]>([]);
   const [loading, setLoading] = useState(false);
 
   const popupRef = useRef<HTMLDivElement | null>(null);
   const pendingTextRef = useRef<TextContext | null>(null);
+
+  /* ---------------- Load chat history ---------------- */
+
+  useEffect(() => {
+    if (!documentId) return;
+
+    fetch(`http://localhost:8000/chat/${documentId}`)
+      .then(res => res.json())
+      .then(data => {
+        setMessages(data.messages || []);
+      });
+  }, [documentId]);
 
   /* ---------------- Upload PDF ---------------- */
 
@@ -97,7 +112,7 @@ export default function Home() {
     setDocumentId(data.document_id);
     setContext(null);
     setQuestion("");
-    setAnswer(null);
+    setMessages([]);
   }
 
   /* ---------------- Text selection ---------------- */
@@ -208,7 +223,7 @@ export default function Home() {
     setContext({
       type: "image",
       region_id: data.region_id,
-      document_id: documentId!,
+      document_id: documentId,
       page_number: pageNumber,
     });
   }
@@ -218,24 +233,39 @@ export default function Home() {
   async function askQuestion() {
     if (!documentId || !context) return;
 
+    const userMsg: ChatMsg = {
+      role: "user",
+      content: question || "Explain this in simple terms.",
+    };
+
+    setMessages(prev => [...prev, userMsg]);
+    setQuestion("");
     setLoading(true);
-    setAnswer(null);
 
     const res = await fetch("http://localhost:8000/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         document_id: documentId,
-        question: question || "Explain this in simple terms.",
-        ...(context.type === "text"
-          ? { context }
-          : { region: context }),
+        question: userMsg.content,
+        ...(context.type === "text" ? { context } : { region: context }),
       }),
     });
 
     const data = await res.json();
-    setAnswer(data.answer);
+
+    setMessages(prev => [
+      ...prev,
+      { role: "assistant", content: data.answer },
+    ]);
+
     setLoading(false);
+    setContext(null);
+  }
+
+  function getContextLabel(ctx: Context) {
+    if (ctx.type === "text") return `Text added p.${ctx.page}`;
+    return `Region added p.${ctx.page_number}`;
   }
 
   /* ---------------- UI ---------------- */
@@ -247,12 +277,7 @@ export default function Home() {
         <input type="file" accept="application/pdf" onChange={handleUpload} />
 
         {pdfUrl && (
-          <Document
-            file={pdfUrl}
-            onLoadSuccess={({ numPages }: { numPages: number }) =>
-              setNumPages(numPages)
-            }
-          >
+          <Document file={pdfUrl} onLoadSuccess={({ numPages }) => setNumPages(numPages)}>
             {Array.from({ length: numPages }, (_, i) => (
               <div
                 key={i}
@@ -358,8 +383,47 @@ export default function Home() {
       </div>
 
       {/* Chat Panel */}
-      <div style={{ flex: 1, padding: "1rem", borderLeft: "1px solid #ccc" }}>
-        <h3>Your Question</h3>
+      <div
+        style={{
+          flex: 1,
+          padding: "1rem",
+          borderLeft: "1px solid #ccc",
+          display: "flex",
+          flexDirection: "column",
+          height: "100vh",
+        }}
+      >
+        <h3>Conversation</h3>
+
+        {context && (
+          <div
+            style={{
+              marginBottom: "0.75rem",
+              padding: "6px 10px",
+              background: "#f3f4f6",
+              border: "1px solid #d1d5db",
+              borderRadius: "6px",
+              fontSize: "13px",
+            }}
+          >
+            {getContextLabel(context)}
+          </div>
+        )}
+
+      <div
+        style={{
+          flex: 1,
+          overflowY: "auto",
+          paddingRight: "6px",
+          marginBottom: "1rem",
+        }}
+      >
+        {messages.map((m, i) => (
+          <ChatMessage key={i} role={m.role} content={m.content} />
+        ))}
+      </div>
+
+
         <textarea
           value={question}
           onChange={(e) => setQuestion(e.target.value)}
@@ -373,13 +437,6 @@ export default function Home() {
         >
           {loading ? "Thinking..." : "Ask"}
         </button>
-
-        {answer && (
-          <>
-            <h3 style={{ marginTop: "1.5rem" }}>Answer</h3>
-            <ChatMessage content={answer} />
-          </>
-        )}
       </div>
     </div>
   );

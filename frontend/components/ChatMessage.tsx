@@ -6,37 +6,29 @@ import rehypeKatex from "rehype-katex";
 import "katex/dist/katex.min.css";
 
 type ChatMessageProps = {
+  role: "user" | "assistant";
   content: string;
 };
 
-export default function ChatMessage({ content }: ChatMessageProps) {
+export default function ChatMessage({ role, content }: ChatMessageProps) {
+  const isUser = role === "user";
+
   return (
-    <div className="max-w-none text-white">
+    <div
+    style={{
+        marginBottom: "0.75rem",
+        padding: "8px 10px",
+        borderRadius: "8px",
+        background: isUser ? "#e5f0ff" : "#f3f4f6",
+        color: "#000",        // 👈 this line
+        fontSize: "16px",
+        lineHeight: "1.6",
+    }}
+    >
+
       <ReactMarkdown
         remarkPlugins={[remarkMath]}
         rehypePlugins={[rehypeKatex]}
-        components={{
-          h2: ({ children }) => (
-            <h2 className="text-xl font-semibold mt-6 mb-3">
-              {children}
-            </h2>
-          ),
-          p: ({ children }) => (
-            <p className="leading-[1.5] mb-3">
-              {children}
-            </p>
-          ),
-          ul: ({ children }) => (
-            <ul className="list-disc pl-6 mb-4">
-              {children}
-            </ul>
-          ),
-          ol: ({ children }) => (
-            <ol className="list-decimal pl-6 mb-4">
-              {children}
-            </ol>
-          ),
-        }}
       >
         {content}
       </ReactMarkdown>
