@@ -56,6 +56,9 @@ type DragRect = {
 type ChatMsg = {
   role: "user" | "assistant";
   content: string;
+  reference?: {
+    page: number;
+  };
 };
 
 /* ---------------- Main Component ---------------- */
@@ -80,6 +83,26 @@ export default function Home() {
 
   const popupRef = useRef<HTMLDivElement | null>(null);
   const pendingTextRef = useRef<TextContext | null>(null);
+
+  // 🔑 page DOM refs
+  const pageRefs = useRef<Record<number, HTMLDivElement | null>>({});
+
+  /* ---------------- Helpers ---------------- */
+
+  function scrollToPage(page: number) {
+    const el = pageRefs.current[page];
+    if (!el) return;
+
+    el.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+  }
+
+  function getContextLabel(ctx: Context) {
+    if (ctx.type === "text") return `Text added p.${ctx.page}`;
+    return `Region added p.${ctx.page_number}`;
+  }
 
   /* ---------------- Load chat history ---------------- */
 
@@ -236,6 +259,9 @@ export default function Home() {
     const userMsg: ChatMsg = {
       role: "user",
       content: question || "Explain this in simple terms.",
+      reference: {
+        page: context.type === "text" ? context.page : context.page_number,
+      },
     };
 
     setMessages(prev => [...prev, userMsg]);
@@ -263,11 +289,6 @@ export default function Home() {
     setContext(null);
   }
 
-  function getContextLabel(ctx: Context) {
-    if (ctx.type === "text") return `Text added p.${ctx.page}`;
-    return `Region added p.${ctx.page_number}`;
-  }
-
   /* ---------------- UI ---------------- */
 
   return (
@@ -278,81 +299,88 @@ export default function Home() {
 
         {pdfUrl && (
           <Document file={pdfUrl} onLoadSuccess={({ numPages }) => setNumPages(numPages)}>
-            {Array.from({ length: numPages }, (_, i) => (
-              <div
-                key={i}
-                data-page-number={i + 1}
-                onDoubleClick={() => {
-                  setRegionMode(true);
-                  setActivePage(i + 1);
-                  setDragRect(null);
-                }}
-                style={{ position: "relative", marginBottom: "1.5rem" }}
-              >
-                <Page
-                  pageNumber={i + 1}
-                  renderTextLayer
-                  renderAnnotationLayer={false}
-                />
+            {Array.from({ length: numPages }, (_, i) => {
+              const pageNumber = i + 1;
 
-                {regionMode && activePage === i + 1 && (
-                  <div
-                    onMouseDown={(e) => {
-                      const r = e.currentTarget.getBoundingClientRect();
-                      setDragStart({
-                        x: e.clientX - r.left,
-                        y: e.clientY - r.top,
-                      });
-                    }}
-                    onMouseMove={(e) => {
-                      if (!dragStart) return;
-                      const r = e.currentTarget.getBoundingClientRect();
-                      const x = e.clientX - r.left;
-                      const y = e.clientY - r.top;
+              return (
+                <div
+                  key={pageNumber}
+                  data-page-number={pageNumber}
+                  ref={(el) => {
+                    pageRefs.current[pageNumber] = el;
+                  }}
+                  onDoubleClick={() => {
+                    setRegionMode(true);
+                    setActivePage(pageNumber);
+                    setDragRect(null);
+                  }}
+                  style={{ position: "relative", marginBottom: "1.5rem" }}
+                >
+                  <Page
+                    pageNumber={pageNumber}
+                    renderTextLayer
+                    renderAnnotationLayer={false}
+                  />
 
-                      setDragRect({
-                        x: Math.min(dragStart.x, x),
-                        y: Math.min(dragStart.y, y),
-                        width: Math.abs(x - dragStart.x),
-                        height: Math.abs(y - dragStart.y),
-                      });
-                    }}
-                    onMouseUp={async (e) => {
-                      if (dragRect) {
-                        await uploadRegion(
-                          i + 1,
-                          dragRect,
-                          e.currentTarget.parentElement!
-                        );
-                      }
-                      setRegionMode(false);
-                      setDragStart(null);
-                      setDragRect(null);
-                    }}
-                    style={{
-                      position: "absolute",
-                      inset: 0,
-                      cursor: "crosshair",
-                      zIndex: 10,
-                    }}
-                  >
-                    {dragRect && (
-                      <div
-                        style={{
-                          position: "absolute",
-                          left: dragRect.x,
-                          top: dragRect.y,
-                          width: dragRect.width,
-                          height: dragRect.height,
-                          border: "2px dashed #0070f3",
-                          background: "rgba(0,112,243,0.15)",
-                        }}
-                      />
-                    )}
-                  </div>
-                )}
-              </div>
-            ))}
+                  {regionMode && activePage === pageNumber && (
+                    <div
+                      onMouseDown={(e) => {
+                        const r = e.currentTarget.getBoundingClientRect();
+                        setDragStart({
+                          x: e.clientX - r.left,
+                          y: e.clientY - r.top,
+                        });
+                      }}
+                      onMouseMove={(e) => {
+                        if (!dragStart) return;
+                        const r = e.currentTarget.getBoundingClientRect();
+                        const x = e.clientX - r.left;
+                        const y = e.clientY - r.top;
+
+                        setDragRect({
+                          x: Math.min(dragStart.x, x),
+                          y: Math.min(dragStart.y, y),
+                          width: Math.abs(x - dragStart.x),
+                          height: Math.abs(y - dragStart.y),
+                        });
+                      }}
+                      onMouseUp={async (e) => {
+                        if (dragRect) {
+                          await uploadRegion(
+                            pageNumber,
+                            dragRect,
+                            e.currentTarget.parentElement!
+                          );
+                        }
+                        setRegionMode(false);
+                        setDragStart(null);
+                        setDragRect(null);
+                      }}
+                      style={{
+                        position: "absolute",
+                        inset: 0,
+                        cursor: "crosshair",
+                        zIndex: 10,
+                      }}
+                    >
+                      {dragRect && (
+                        <div
+                          style={{
+                            position: "absolute",
+                            left: dragRect.x,
+                            top: dragRect.y,
+                            width: dragRect.width,
+                            height: dragRect.height,
+                            border: "2px dashed #0070f3",
+                            background: "rgba(0,112,243,0.15)",
+                          }}
+                        />
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </Document>
         )}
 
@@ -410,19 +438,20 @@ export default function Home() {
           </div>
         )}
 
-      <div
-        style={{
-          flex: 1,
-          overflowY: "auto",
-          paddingRight: "6px",
-          marginBottom: "1rem",
-        }}
-      >
-        {messages.map((m, i) => (
-          <ChatMessage key={i} role={m.role} content={m.content} />
-        ))}
-      </div>
-
+        <div style={{ flex: 1, overflowY: "auto", marginBottom: "1rem" }}>
+          {messages.map((m, i) => (
+            <ChatMessage
+              key={i}
+              role={m.role}
+              content={m.content}
+              onClick={
+                m.role === "user" && m.reference
+                  ? () => scrollToPage(m.reference.page)
+                  : undefined
+              }
+            />
+          ))}
+        </div>
 
         <textarea
           value={question}
