@@ -395,6 +395,22 @@ def upload_region(document_id: str = Form(...), page_number: int = Form(...), re
 # Get question from frontend
 @app.post("/ask")
 def ask_document(req: AskQuestion):
+
+    reference = None
+
+    if req.context:
+        reference = {
+            "type": "text",
+            "page": req.context.page,
+            "text": req.context.text
+        }
+    elif req.region:
+        reference = {
+            "type": "region",
+            "page": req.region.page_number,
+            "region_id": req.region.region_id
+        }
+
     # Example of pages = [{"page_number": ..., "text": ...}]
     pages = get_pages(req.document_id)
 
