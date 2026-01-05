@@ -61,6 +61,17 @@ type ChatMsg = {
   };
 };
 
+// 🟡 Phase 2.3
+type Highlight = {
+  page: number;
+  rect: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+};
+
 /* ---------------- Main Component ---------------- */
 
 export default function Home() {
@@ -84,8 +95,13 @@ export default function Home() {
   const popupRef = useRef<HTMLDivElement | null>(null);
   const pendingTextRef = useRef<TextContext | null>(null);
 
-  // 🔑 page DOM refs
+  // 🟡 Phase 2.3 (text): store raw DOM rect
+  const pendingTextRectRef = useRef<DOMRect | null>(null);
+
   const pageRefs = useRef<Record<number, HTMLDivElement | null>>({});
+
+  // 🟡 Phase 2.3: stored highlights
+  const [highlights, setHighlights] = useState<Highlight[]>([]);
 
   /* ---------------- Helpers ---------------- */
 
@@ -93,10 +109,7 @@ export default function Home() {
     const el = pageRefs.current[page];
     if (!el) return;
 
-    el.scrollIntoView({
-      behavior: "smooth",
-      block: "start",
-    });
+    el.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
   function getContextLabel(ctx: Context) {
@@ -136,6 +149,7 @@ export default function Home() {
     setContext(null);
     setQuestion("");
     setMessages([]);
+    setHighlights([]);
   }
 
   /* ---------------- Text selection ---------------- */
@@ -175,6 +189,9 @@ export default function Home() {
         page: pageNum,
       };
 
+      // 🟡 Phase 2.3 (text): save rect
+      pendingTextRectRef.current = rect;
+
       showPopup(rect);
     }
 
@@ -204,11 +221,27 @@ export default function Home() {
   ) {
     if (!documentId) return;
 
+    const pageWidth = pageContainer.clientWidth;
+    const pageHeight = pageContainer.clientHeight;
+
+    const normalizedRect = {
+      x: rect.x / pageWidth,
+      y: rect.y / pageHeight,
+      width: rect.width / pageWidth,
+      height: rect.height / pageHeight,
+    };
+
+    setHighlights(prev => [
+      ...prev,
+      { page: pageNumber, rect: normalizedRect },
+    ]);
+
+    // existing image upload (unchanged)
     const canvas = pageContainer.querySelector("canvas");
     if (!canvas) return;
 
-    const scaleX = canvas.width / pageContainer.clientWidth;
-    const scaleY = canvas.height / pageContainer.clientHeight;
+    const scaleX = canvas.width / pageWidth;
+    const scaleY = canvas.height / pageHeight;
 
     const cropCanvas = document.createElement("canvas");
     cropCanvas.width = rect.width * scaleX;
@@ -228,7 +261,7 @@ export default function Home() {
     );
 
     const blob = await new Promise<Blob>((resolve) =>
-      cropCanvas.toBlob((b) => resolve(b!), "image/png")
+      cropCanvas.toBlob(b => resolve(b!), "image/png")
     );
 
     const formData = new FormData();
@@ -256,17 +289,41 @@ export default function Home() {
   async function askQuestion() {
     if (!documentId || !context) return;
 
+    const page =
+      context.type === "text" ? context.page : context.page_number;
+
     const userMsg: ChatMsg = {
       role: "user",
       content: question || "Explain this in simple terms.",
-      reference: {
-        page: context.type === "text" ? context.page : context.page_number,
-      },
+      reference: { page },
     };
 
     setMessages(prev => [...prev, userMsg]);
     setQuestion("");
     setLoading(true);
+
+    // 🟡 Phase 2.3 (text): convert rect → highlight
+    if (context.type === "text" && pendingTextRectRef.current) {
+      const pageEl = pageRefs.current[page];
+      if (pageEl) {
+        const r = pageEl.getBoundingClientRect();
+        const rect = pendingTextRectRef.current;
+
+        setHighlights(prev => [
+          ...prev,
+          {
+            page,
+            rect: {
+              x: (rect.left - r.left) / r.width,
+              y: (rect.top - r.top) / r.height,
+              width: rect.width / r.width,
+              height: rect.height / r.height,
+            },
+          },
+        ]);
+      }
+      pendingTextRectRef.current = null;
+    }
 
     const res = await fetch("http://localhost:8000/ask", {
       method: "POST",
@@ -301,14 +358,13 @@ export default function Home() {
           <Document file={pdfUrl} onLoadSuccess={({ numPages }) => setNumPages(numPages)}>
             {Array.from({ length: numPages }, (_, i) => {
               const pageNumber = i + 1;
+              const pageHighlights = highlights.filter(h => h.page === pageNumber);
 
               return (
                 <div
                   key={pageNumber}
                   data-page-number={pageNumber}
-                  ref={(el) => {
-                    pageRefs.current[pageNumber] = el;
-                  }}
+                  ref={el => (pageRefs.current[pageNumber] = el)}
                   onDoubleClick={() => {
                     setRegionMode(true);
                     setActivePage(pageNumber);
@@ -316,11 +372,24 @@ export default function Home() {
                   }}
                   style={{ position: "relative", marginBottom: "1.5rem" }}
                 >
-                  <Page
-                    pageNumber={pageNumber}
-                    renderTextLayer
-                    renderAnnotationLayer={false}
-                  />
+                  <Page pageNumber={pageNumber} renderTextLayer renderAnnotationLayer={false} />
+
+                  {pageHighlights.map((h, idx) => (
+                    <div
+                      key={idx}
+                      style={{
+                        position: "absolute",
+                        left: `${h.rect.x * 100}%`,
+                        top: `${h.rect.y * 100}%`,
+                        width: `${h.rect.width * 100}%`,
+                        height: `${h.rect.height * 100}%`,
+                        background: "rgba(255, 235, 59, 0.35)",
+                        border: "2px solid rgba(255, 193, 7, 0.9)",
+                        pointerEvents: "none",
+                        zIndex: 5,
+                      }}
+                    />
+                  ))}
 
                   {regionMode && activePage === pageNumber && (
                     <div
@@ -346,11 +415,7 @@ export default function Home() {
                       }}
                       onMouseUp={async (e) => {
                         if (dragRect) {
-                          await uploadRegion(
-                            pageNumber,
-                            dragRect,
-                            e.currentTarget.parentElement!
-                          );
+                          await uploadRegion(pageNumber, dragRect, e.currentTarget.parentElement!);
                         }
                         setRegionMode(false);
                         setDragStart(null);
@@ -411,32 +476,8 @@ export default function Home() {
       </div>
 
       {/* Chat Panel */}
-      <div
-        style={{
-          flex: 1,
-          padding: "1rem",
-          borderLeft: "1px solid #ccc",
-          display: "flex",
-          flexDirection: "column",
-          height: "100vh",
-        }}
-      >
+      <div style={{ flex: 1, padding: "1rem", borderLeft: "1px solid #ccc", display: "flex", flexDirection: "column" }}>
         <h3>Conversation</h3>
-
-        {context && (
-          <div
-            style={{
-              marginBottom: "0.75rem",
-              padding: "6px 10px",
-              background: "#f3f4f6",
-              border: "1px solid #d1d5db",
-              borderRadius: "6px",
-              fontSize: "13px",
-            }}
-          >
-            {getContextLabel(context)}
-          </div>
-        )}
 
         <div style={{ flex: 1, overflowY: "auto", marginBottom: "1rem" }}>
           {messages.map((m, i) => (
@@ -459,11 +500,7 @@ export default function Home() {
           style={{ width: "100%", height: "80px" }}
         />
 
-        <button
-          onClick={askQuestion}
-          disabled={!context || loading}
-          style={{ marginTop: "1rem" }}
-        >
+        <button onClick={askQuestion} disabled={!context || loading} style={{ marginTop: "1rem" }}>
           {loading ? "Thinking..." : "Ask"}
         </button>
       </div>
