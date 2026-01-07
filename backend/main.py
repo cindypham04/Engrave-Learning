@@ -13,7 +13,7 @@ from openai import OpenAI
 import base64
 import re
 from db import save_pages, get_pages, get_page_count
-from db import get_messages, save_message
+from db import get_messages, save_message, get_annotation, get_messages_by_annotation, create_annotation
 
 # load_dotenv()  # Load OpenAI API key from .env file
 
@@ -110,7 +110,6 @@ def normalize_math(text: str) -> str:
 
     flush_buffer()
     return "\n".join(normalized)
-
 
 
 system_prompt = """ 
@@ -267,9 +266,8 @@ def ask_openai(prompt_text, system_prompt=system_prompt):
     )
     return response.output_text
 
-# Case 2: user asked about a region image - call OpenAI
+# Case 2: user asked about a region - call OpenAI 
 def ask_region(prompt_text, region_id, system_prompt=system_prompt):
-    # Resolve image path
     png_path = os.path.join(REGION_DIR, f"{region_id}.png")
     jpeg_path = os.path.join(REGION_DIR, f"{region_id}.jpeg")
 
@@ -282,55 +280,41 @@ def ask_region(prompt_text, region_id, system_prompt=system_prompt):
     else:
         raise HTTPException(status_code=404, detail="Region image not found")
 
-    # Load image bytes
     with open(image_path, "rb") as f:
         img_bytes = f.read()
 
-    # Encode as Base64 and wrap as data URL
     image_base64 = base64.b64encode(img_bytes).decode("utf-8")
     data_url = f"data:{mime};base64,{image_base64}"
 
-    # Call OpenAI
     response = client.responses.create(
         model="gpt-4.1-mini",
         input=[
-            {
-                "role": "system",
-                "content": system_prompt
-            },
+            {"role": "system", "content": system_prompt},
             {
                 "role": "user",
                 "content": [
                     {"type": "input_text", "text": prompt_text},
-                    {
-                        "type": "input_image",
-                        "image_url": data_url
-                    }
-                ]
-            }
+                    {"type": "input_image", "image_url": data_url},
+                ],
+            },
         ],
-        temperature=0.3
+        temperature=0.3,
     )
 
     return response.output_text
 
-
-# Store Context objects
-class Context(BaseModel):
-    text: str
-    page: Optional[int] = None
-
-class Region(BaseModel):
-    region_id: str
-    document_id:str
+# Store annotation object
+class CreateAnnotation(BaseModel):
+    document_id: str
     page_number: int
+    type: str
+    geometry: Optional[dict] = None
 
 # Store Ask Question objects
 class AskQuestion(BaseModel):
     document_id: str
+    annotation_id: Optional[int] = None
     question: str
-    context: Optional[Context] = None
-    region: Optional[Region] = None
 
 # Get the pdf file from frontend then write it into uploads
 @app.post("/upload")
@@ -350,6 +334,16 @@ async def upload_file(file: UploadFile = File(...)):
         "original_filename": file.filename,
         "url": f"http://localhost:8000/files/{document_id}"
     }
+
+@app.post("/annotations")
+def create_text_annotation(payload: CreateAnnotation):
+    annotation_id = create_annotation(
+        document_id=payload.document_id,
+        page_number=payload.page_number,
+        type=payload.type,
+        geometry=payload.geometry,
+    )
+    return {"annotation_id": annotation_id}
 
 
 # Return document to frontend
@@ -383,33 +377,25 @@ def upload_region(document_id: str = Form(...), page_number: int = Form(...), re
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(region.file, buffer)
 
+    annotation_id = create_annotation(
+        document_id=document_id,
+        page_number=page_number,
+        type="region",
+        geometry=None,
+        region_id=region_id,
+    )
+
     return {
+        "annotation_id": annotation_id,
         "region_id": region_id,
         "document_id": document_id,
         "page_number": page_number,
-        "content_type": region.content_type,
-        "url": f"http://localhost:8000/regions/{region_id}"
+        "url": f"http://localhost:8000/regions/{region_id}",
     }
-
 
 # Get question from frontend
 @app.post("/ask")
 def ask_document(req: AskQuestion):
-
-    reference = None
-
-    if req.context:
-        reference = {
-            "type": "text",
-            "page": req.context.page,
-            "text": req.context.text
-        }
-    elif req.region:
-        reference = {
-            "type": "region",
-            "page": req.region.page_number,
-            "region_id": req.region.region_id
-        }
 
     # Example of pages = [{"page_number": ..., "text": ...}]
     pages = get_pages(req.document_id)
@@ -417,117 +403,92 @@ def ask_document(req: AskQuestion):
     if not pages:
         return {"answer": "Document not found."}
     
-    if req.question.strip():
-        save_message(
-            req.document_id,
-            "user",
-            req.question
+    # Save user message first
+    save_message(
+        document_id = req.document_id,
+        role = "user",
+        content = req.question,
+        annotation_id = req.annotation_id,
+    )
+    # ---------- Annotation-based mode ----------
+    if req.annotation_id:
+        annotation = get_annotation(req.annotation_id)
+        if not annotation:
+            raise HTTPException(status_code=404, detail="Annotation not found")
+
+        if annotation["document_id"] != req.document_id:
+            raise HTTPException(status_code=400, detail="Annotation mismatch")
+
+        page_idx = annotation["page_number"] - 1
+
+        prev_text = pages[page_idx - 1]["text"] if page_idx - 1 >= 0 else ""
+        curr_text = pages[page_idx]["text"]
+        next_text = pages[page_idx + 1]["text"] if page_idx + 1 < len(pages) else ""
+
+        history = get_messages_by_annotation(req.annotation_id)
+        history_text = "\n".join(
+            f"{m['role']}: {m['content']}"
+            for m in history
         )
 
+        prompt = f"""
+The student is asking a question about a specific part of the document.
 
-    # Case 1: user provided context (selected text)
-    # Prompt format: context (selected text) -> rule -> question -> reference pages 
-    if req.context:
-        print("Context mode")
-        print("Text:", req.context.text)
+Previous conversation:
+{history_text}
 
-        # Get reference page number, also the previous and following pages
-        current_idx = req.context.page - 1
+The annotation is located on page {annotation['page_number']}.
 
-        previous_page_context = pages[current_idx - 1]['text'] if current_idx - 1 >= 0 else ""
-        current_page_context = pages[current_idx]['text']
-        next_page_context = pages[current_idx + 1]['text'] if current_idx + 1 < len(pages) else ""
+Relevant document content:
+{prev_text}
+{curr_text}
+{next_text}
 
-        # Use context as primary signal
-        context = f"""
-        The student selected the following text from the document:
+Question:
+{req.question}
+"""
 
-        \"\"\"{req.context.text}\"\"\"
+        if annotation["type"] == "region":
+            if not annotation.get("region_id"):
+                raise HTTPException(status_code=500, detail="Region annotation missing region_id")
+            answer = ask_region(prompt_text=prompt, region_id=annotation["region_id"])
+        else:
+            answer = ask_openai(prompt_text=prompt)
 
-        If the question uses “this”, “it”, or “that”, they refer to the highlighted text above.
-        Question: {req.question}.
-
-        Supporting document content: 
-        {current_page_context}.
-        {previous_page_context}.
-        {next_page_context}.
-        """
-
-        print("FINAL PROMPT:\n", context)
-
-        answer = ask_openai(prompt_text=context)
         answer = normalize_math(answer)
 
         save_message(
-            req.document_id,
-            "assistant",
-            answer
+            document_id=req.document_id,
+            role="assistant",
+            content=answer,
+            annotation_id=req.annotation_id,
         )
 
         return {"answer": answer}
 
-    
-    # Case 2: user provided region image
-    # Prompt format: question -> region image -> reference pages
-    elif req.region:
-        print("Region mode")
+    # ---------- Document-level fallback ----------
+    prompt = f"""
+    Answer the following question using the document below.
 
-        if req.region.document_id != req.document_id:
-            raise HTTPException(
-                status_code=400,
-                detail="Region image does not belong to the specified document."
-            )
-        
-        # Get reference page number, also the previous and following pages
-        current_idx = req.region.page_number - 1
+    {reshape_pages(pages)}
 
-        previous_page_context = pages[current_idx - 1]["text"] if current_idx - 1 >= 0 else ""
-        current_page_context = pages[current_idx]["text"]
-        next_page_context = pages[current_idx + 1]["text"] if current_idx + 1 < len(pages) else ""
+    Question:
+    {req.question}
+    """
 
-        region_context = f""" The student has attached a cropped image taken from page {req.region.page_number} of the document.
-        
-        The image may contain a diagram, equation, or visual explanation.
-        Use the image as the primary source of information.
-
-        The text below comes from the surrounding slide and is provided only to clarify context.
-        Do not assume meanings for symbols or relationships that are not visible or explained.
-
-        Question: {req.question}.
-
-        Supporting text from the document:
-        {current_page_context}.
-        {previous_page_context}.
-        {next_page_context}.
-        """
-
-        answer = ask_region(prompt_text=region_context, region_id=req.region.region_id)
-        answer = normalize_math(answer)
-
-        save_message(
-            req.document_id,
-            "assistant",
-            answer
-        )
-
-        return {"answer": answer}
-
-
-    # Case 3: no context provided, use full document
-    # Prompt format: question -> whole document
-    print("Document-wise mode")
-    context = f"Answer the following question {req.question} using the following document content: {reshape_pages(pages)}"
-    answer = ask_openai(prompt_text=context)
+    answer = ask_openai(prompt_text=prompt)
     answer = normalize_math(answer)
 
     save_message(
-        req.document_id,
-        "assistant",
-        answer
+        document_id=req.document_id,
+        role="assistant",
+        content=answer,
+        annotation_id=None,
     )
 
     return {"answer": answer}
 
+    
 
 # Get region image from /regions
 @app.get("/regions/{region_id}")
@@ -549,6 +510,14 @@ def get_region(region_id: str):
 @app.get("/chat/{document_id}")
 def get_chat(document_id: str):
     return {"messages": get_messages(document_id)}
+
+
+@app.get("/chat/annotation/{annotation_id}")
+def get_annotation_chat(annotation_id: int):
+    return {
+        "messages": get_messages_by_annotation(annotation_id)
+    }
+
 
 # Debug route 
 @app.get("/debug/page_count")

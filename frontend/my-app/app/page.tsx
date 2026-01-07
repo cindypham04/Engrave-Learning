@@ -61,9 +61,10 @@ type ChatMsg = {
   };
 };
 
-// 🟡 Phase 2.3
+
 type Highlight = {
   page: number;
+  annotation_id: number;   // 👈 ADD THIS
   rect: {
     x: number;
     y: number;
@@ -95,13 +96,16 @@ export default function Home() {
   const popupRef = useRef<HTMLDivElement | null>(null);
   const pendingTextRef = useRef<TextContext | null>(null);
 
-  // 🟡 Phase 2.3 (text): store raw DOM rect
+  // 🟡 Text: store raw DOM rect
   const pendingTextRectRef = useRef<DOMRect | null>(null);
 
   const pageRefs = useRef<Record<number, HTMLDivElement | null>>({});
 
-  // 🟡 Phase 2.3: stored highlights
+  // Stored highlights
   const [highlights, setHighlights] = useState<Highlight[]>([]);
+
+  // New state for annotation
+  const [activeAnnotationId, setActiveAnnotationId] = useState<number | null>(null);
 
   /* ---------------- Helpers ---------------- */
 
@@ -116,6 +120,16 @@ export default function Home() {
     if (ctx.type === "text") return `Text added p.${ctx.page}`;
     return `Region added p.${ctx.page_number}`;
   }
+
+  async function loadAnnotationChat(annotationId: number) {
+    const res = await fetch(
+      `http://localhost:8000/chat/annotation/${annotationId}`
+    );
+    const data = await res.json();
+    setMessages(data.messages || []);
+  }
+
+
 
   /* ---------------- Load chat history ---------------- */
 
@@ -147,6 +161,7 @@ export default function Home() {
     setPdfUrl(data.url);
     setDocumentId(data.document_id);
     setContext(null);
+    setActiveAnnotationId(null);
     setQuestion("");
     setMessages([]);
     setHighlights([]);
@@ -189,7 +204,7 @@ export default function Home() {
         page: pageNum,
       };
 
-      // 🟡 Phase 2.3 (text): save rect
+      // Text: save rect
       pendingTextRectRef.current = rect;
 
       showPopup(rect);
@@ -231,11 +246,6 @@ export default function Home() {
       height: rect.height / pageHeight,
     };
 
-    setHighlights(prev => [
-      ...prev,
-      { page: pageNumber, rect: normalizedRect },
-    ]);
-
     // existing image upload (unchanged)
     const canvas = pageContainer.querySelector("canvas");
     if (!canvas) return;
@@ -276,6 +286,17 @@ export default function Home() {
 
     const data = await res.json();
 
+    setHighlights(prev => [
+      ...prev,
+      {
+        page: pageNumber,
+        annotation_id: data.annotation_id, 
+        rect: normalizedRect,
+      },
+    ]);
+
+    setActiveAnnotationId(data.annotation_id);
+
     setContext({
       type: "image",
       region_id: data.region_id,
@@ -287,15 +308,20 @@ export default function Home() {
   /* ---------------- Ask backend ---------------- */
 
   async function askQuestion() {
-    if (!documentId || !context) return;
+    if (!documentId) return;
 
     const page =
-      context.type === "text" ? context.page : context.page_number;
+      context?.type === "text"
+        ? context.page
+        : context?.type === "image"
+        ? context.page_number
+        : undefined;
+
 
     const userMsg: ChatMsg = {
       role: "user",
       content: question || "Explain this in simple terms.",
-      reference: { page },
+      ...(page ? { reference: { page } } : {}),
     };
 
     setMessages(prev => [...prev, userMsg]);
@@ -303,7 +329,7 @@ export default function Home() {
     setLoading(true);
 
     // 🟡 Phase 2.3 (text): convert rect → highlight
-    if (context.type === "text" && pendingTextRectRef.current) {
+    if (context?.type === "text" && pendingTextRectRef.current && page) {
       const pageEl = pageRefs.current[page];
       if (pageEl) {
         const r = pageEl.getBoundingClientRect();
@@ -313,6 +339,7 @@ export default function Home() {
           ...prev,
           {
             page,
+            annotation_id: activeAnnotationId!, // 👈 ADD
             rect: {
               x: (rect.left - r.left) / r.width,
               y: (rect.top - r.top) / r.height,
@@ -330,8 +357,8 @@ export default function Home() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         document_id: documentId,
+        annotation_id: activeAnnotationId,
         question: userMsg.content,
-        ...(context.type === "text" ? { context } : { region: context }),
       }),
     });
 
@@ -343,7 +370,6 @@ export default function Home() {
     ]);
 
     setLoading(false);
-    setContext(null);
   }
 
   /* ---------------- UI ---------------- */
@@ -377,6 +403,17 @@ export default function Home() {
                   {pageHighlights.map((h, idx) => (
                     <div
                       key={idx}
+                      onClick={() => {
+                        setActiveAnnotationId(h.annotation_id);
+
+                        setContext({
+                          type: "text", // temporary, refined later
+                          page: h.page,
+                          text: "",
+                        });
+
+                        loadAnnotationChat(h.annotation_id);
+                      }}
                       style={{
                         position: "absolute",
                         left: `${h.rect.x * 100}%`,
@@ -385,7 +422,7 @@ export default function Home() {
                         height: `${h.rect.height * 100}%`,
                         background: "rgba(255, 235, 59, 0.35)",
                         border: "2px solid rgba(255, 193, 7, 0.9)",
-                        pointerEvents: "none",
+                        pointerEvents: "auto",
                         zIndex: 5,
                       }}
                     />
@@ -452,13 +489,46 @@ export default function Home() {
         {!regionMode && (
           <div
             ref={popupRef}
-            onMouseDown={() => {
-              if (pendingTextRef.current) {
-                setContext(pendingTextRef.current);
-                pendingTextRef.current = null;
-                hidePopup();
+            onMouseDown={async () => {
+              if (!pendingTextRef.current || !documentId) return;
+
+              const ctx = pendingTextRef.current;
+
+              const rect = pendingTextRectRef.current;
+              const pageEl = pageRefs.current[ctx.page];
+
+              let geometry = null;
+
+              if (rect && pageEl) {
+                const pageRect = pageEl.getBoundingClientRect();
+                geometry = {
+                  x: (rect.left - pageRect.left) / pageRect.width,
+                  y: (rect.top - pageRect.top) / pageRect.height,
+                  width: rect.width / pageRect.width,
+                  height: rect.height / pageRect.height,
+                };
               }
+
+              const res = await fetch("http://localhost:8000/annotations", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  document_id: documentId,
+                  page_number: ctx.page,
+                  type: "text",
+                  geometry,
+                  text: ctx.text,
+                }),
+              });
+
+              const data = await res.json();
+              setActiveAnnotationId(data.annotation_id);
+              setContext(ctx);
+
+              pendingTextRef.current = null;
+              hidePopup();
             }}
+
             style={{
               position: "absolute",
               display: "none",
@@ -500,7 +570,11 @@ export default function Home() {
           style={{ width: "100%", height: "80px" }}
         />
 
-        <button onClick={askQuestion} disabled={!context || loading} style={{ marginTop: "1rem" }}>
+        <button
+          onClick={askQuestion}
+          disabled={loading}
+          style={{ marginTop: "1rem" }}
+        >
           {loading ? "Thinking..." : "Ask"}
         </button>
       </div>
