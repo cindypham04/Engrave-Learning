@@ -13,7 +13,8 @@ from openai import OpenAI
 import base64
 import re
 from db import save_pages, get_pages, get_page_count
-from db import get_messages, save_message, get_annotation, get_messages_by_annotation, create_annotation
+from db import get_messages, save_message, get_annotation, get_messages_by_annotation, create_annotation, get_annotations_by_document
+from db import get_file, get_document_id_by_file, create_file
 
 # load_dotenv()  # Load OpenAI API key from .env file
 
@@ -309,6 +310,7 @@ class CreateAnnotation(BaseModel):
     page_number: int
     type: str
     geometry: Optional[dict] = None
+    text: Optional[str] = None
 
 # Store Ask Question objects
 class AskQuestion(BaseModel):
@@ -319,21 +321,36 @@ class AskQuestion(BaseModel):
 # Get the pdf file from frontend then write it into uploads
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
+    # 1. Generate internal document_id
     document_id = str(uuid.uuid4())
 
+    # 2. Save PDF to disk (unchanged)
     file_path = os.path.join(UPLOAD_DIR, f"{document_id}.pdf")
-
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
+    # 3. Extract and save pages (unchanged)
     pages = extract_pages_from_pdf(document_id)
     save_pages(pages)
 
+    # 4. Decide file title (temporary strategy)
+    title = os.path.splitext(file.filename)[0]
+
+    # 5. Create file record (NEW)
+    file_id = create_file(
+        folder_id=None,        # root-level for now
+        document_id=document_id,
+        title=title,
+    )
+
+    # 6. Return both IDs (temporary)
     return {
-        "document_id" : document_id,
-        "original_filename": file.filename,
-        "url": f"http://localhost:8000/files/{document_id}"
+        "file_id": file_id,
+        "document_id": document_id,  # will be removed later
+        "title": title,
+        "url": f"http://localhost:8000/files/{document_id}",
     }
+
 
 @app.post("/annotations")
 def create_text_annotation(payload: CreateAnnotation):
@@ -342,13 +359,50 @@ def create_text_annotation(payload: CreateAnnotation):
         page_number=payload.page_number,
         type=payload.type,
         geometry=payload.geometry,
+        text=payload.text,
     )
     return {"annotation_id": annotation_id}
+
+# Return “file metadata” 
+@app.get("/files/{file_id}/meta")
+def get_file_metadata(file_id: int):
+    file = get_file(file_id)
+    if not file:
+        raise HTTPException(status_code=404, detail="File not found")
+    return file
+
+@app.get("/files/{file_id}/state")
+def get_file_state(file_id: int):
+    # 1. Get file metadata
+    file = get_file(file_id)
+    if not file:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    document_id = file["document_id"]
+
+    # 2. Load document-scoped data
+    messages = get_messages(document_id)
+    annotations = get_annotations_by_document(document_id)
+
+    # 3. Build PDF URL
+    pdf_url = f"http://localhost:8000/files/{document_id}"
+
+    # 4. Return unified state
+    return {
+        "file": {
+            "id": file["id"],
+            "title": file["title"],
+            "folder_id": file["folder_id"],
+        },
+        "pdf_url": pdf_url,
+        "messages": messages,
+        "annotations": annotations,
+    }
 
 
 # Return document to frontend
 @app.get("/files/{document_id}")
-def get_file(document_id: str):
+def get_pdf_file(document_id: str):
     return FileResponse(
         path=os.path.join(UPLOAD_DIR,  f"{document_id}.pdf"),
         media_type="application/pdf"
@@ -413,6 +467,8 @@ def ask_document(req: AskQuestion):
     # ---------- Annotation-based mode ----------
     if req.annotation_id:
         annotation = get_annotation(req.annotation_id)
+        selected_text = annotation.get("text")
+
         if not annotation:
             raise HTTPException(status_code=404, detail="Annotation not found")
 
@@ -432,17 +488,25 @@ def ask_document(req: AskQuestion):
         )
 
         prompt = f"""
-The student is asking a question about a specific part of the document.
+The student selected the following exact text from the document:
 
-Previous conversation:
-{history_text}
+\"\"\"{selected_text}\"\"\"
 
-The annotation is located on page {annotation['page_number']}.
+This text appears on page {annotation['page_number']}.
 
-Relevant document content:
+Here is surrounding context from the document (for reference only):
+
+--- Previous context ---
 {prev_text}
+
+--- Same page ---
 {curr_text}
+
+--- Next context ---
 {next_text}
+
+Answer the question by focusing primarily on the selected text.
+Only use the surrounding context if needed for clarification.
 
 Question:
 {req.question}
@@ -488,7 +552,6 @@ Question:
 
     return {"answer": answer}
 
-    
 
 # Get region image from /regions
 @app.get("/regions/{region_id}")
@@ -518,6 +581,20 @@ def get_annotation_chat(annotation_id: int):
         "messages": get_messages_by_annotation(annotation_id)
     }
 
+@app.get("/annotations/{annotation_id}")
+def fetch_annotation(annotation_id: int):
+    annotation = get_annotation(annotation_id)
+
+    if not annotation:
+        raise HTTPException(status_code=404, detail="Annotation not found")
+
+    return annotation
+
+@app.get("/annotations/document/{document_id}")
+def get_document_annotations(document_id: str):
+    return {
+        "annotations": get_annotations_by_document(document_id)
+    }
 
 # Debug route 
 @app.get("/debug/page_count")

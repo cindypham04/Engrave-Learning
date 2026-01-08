@@ -56,11 +56,11 @@ type DragRect = {
 type ChatMsg = {
   role: "user" | "assistant";
   content: string;
+  annotation_id?: number;
   reference?: {
     page: number;
   };
 };
-
 
 type Highlight = {
   page: number;
@@ -104,8 +104,39 @@ export default function Home() {
   // Stored highlights
   const [highlights, setHighlights] = useState<Highlight[]>([]);
 
-  // New state for annotation
+  // State for annotation
   const [activeAnnotationId, setActiveAnnotationId] = useState<number | null>(null);
+
+  // State of document chat or annotation chat
+  const [chatMode, setChatMode] = useState<"document" | "annotation">("document");
+
+  // State of file
+  const [activeFileId, setActiveFileId] = useState<number | null>(null);
+
+  // State of sidebar
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [folders, setFolders] = useState<any[]>([]);
+  const [files, setFiles] = useState<any[]>([]);
+
+  const [activeFileTitle, setActiveFileTitle] = useState<string | null>(null);
+
+    // ---------- load sidebar data (ONCE) ----------
+  useEffect(() => {
+    fetch("http://localhost:8000/folders")
+      .then(res => res.json())
+      .then(data => setFolders(data.folders));
+
+    fetch("http://localhost:8000/files")
+      .then(res => res.json())
+      .then(data => setFiles(Array.isArray(data) ? data : data.files ?? []));
+  }, []);
+
+  // ---------- load file state ----------
+  useEffect(() => {
+    if (!activeFileId) return;
+    loadFileState(activeFileId);
+  }, [activeFileId]);
+  
 
   /* ---------------- Helpers ---------------- */
 
@@ -129,19 +160,44 @@ export default function Home() {
     setMessages(data.messages || []);
   }
 
+  async function fetchAnnotation(annotationId: number) {
+    const res = await fetch(
+      `http://localhost:8000/annotations/${annotationId}`
+    );
+
+    if (!res.ok) {
+      throw new Error("Failed to fetch annotation");
+    }
+
+    return res.json();
+  }
+
+  async function loadFileState(fileId: number) {
+    const res = await fetch(`http://localhost:8000/files/${fileId}/state`);
+    if (!res.ok) throw new Error("Failed to load file state");
+    const data = await res.json();
+
+    setPdfUrl(data.pdf_url);
+    setMessages(data.messages || []);
+
+    setActiveFileTitle(data.file.title);
+
+    setDocumentId(
+      data.pdf_url.split("/").pop() // extract document_id
+    );
+
+    const restoredHighlights = (data.annotations || [])
+      .filter((a: any) => a.geometry)
+      .map((a: any) => ({
+        page: a.page_number,
+        annotation_id: a.id,
+        rect: a.geometry,
+      }));
+
+    setHighlights(restoredHighlights);
+  }
 
 
-  /* ---------------- Load chat history ---------------- */
-
-  useEffect(() => {
-    if (!documentId) return;
-
-    fetch(`http://localhost:8000/chat/${documentId}`)
-      .then(res => res.json())
-      .then(data => {
-        setMessages(data.messages || []);
-      });
-  }, [documentId]);
 
   /* ---------------- Upload PDF ---------------- */
 
@@ -158,13 +214,11 @@ export default function Home() {
 
     const data = await res.json();
 
-    setPdfUrl(data.url);
-    setDocumentId(data.document_id);
+    setActiveFileId(data.file_id);
     setContext(null);
     setActiveAnnotationId(null);
     setQuestion("");
-    setMessages([]);
-    setHighlights([]);
+
   }
 
   /* ---------------- Text selection ---------------- */
@@ -321,8 +375,10 @@ export default function Home() {
     const userMsg: ChatMsg = {
       role: "user",
       content: question || "Explain this in simple terms.",
+      annotation_id: activeAnnotationId ?? undefined,
       ...(page ? { reference: { page } } : {}),
     };
+
 
     setMessages(prev => [...prev, userMsg]);
     setQuestion("");
@@ -373,12 +429,51 @@ export default function Home() {
   }
 
   /* ---------------- UI ---------------- */
-
   return (
     <div style={{ display: "flex", height: "100vh" }}>
+      {/* Sidebar */}
+      <div
+        style={{
+          width: sidebarOpen ? 240 : 0,
+          overflow: "hidden",
+          transition: "width 0.2s ease",
+        }}
+      >
+        {sidebarOpen &&
+          Array.isArray(files) &&
+          files.map(file => (
+            <div
+              key={file.id}
+              onClick={() => {
+                setActiveFileId(file.id);
+                setChatMode("document");
+                setActiveAnnotationId(null);
+                setContext(null);
+              }}
+              style={{
+                padding: "8px",
+                cursor: "pointer",
+                background: file.id === activeFileId ? "#222" : "transparent",
+              }}
+            >
+              {file.title}
+            </div>
+          ))}
+        </div>
+
+
       {/* PDF Viewer */}
       <div style={{ flex: 2, padding: "1rem", overflow: "auto" }}>
         <input type="file" accept="application/pdf" onChange={handleUpload} />
+        <button
+          onClick={() => setSidebarOpen(v => !v)}
+          style={{
+            marginBottom: "0.5rem",
+            fontSize: "0.85rem",
+          }}
+        >
+          {sidebarOpen ? "Hide files" : "Show files"}
+        </button>
 
         {pdfUrl && (
           <Document file={pdfUrl} onLoadSuccess={({ numPages }) => setNumPages(numPages)}>
@@ -400,33 +495,51 @@ export default function Home() {
                 >
                   <Page pageNumber={pageNumber} renderTextLayer renderAnnotationLayer={false} />
 
-                  {pageHighlights.map((h, idx) => (
-                    <div
-                      key={idx}
-                      onClick={() => {
-                        setActiveAnnotationId(h.annotation_id);
+                  {pageHighlights.map((h, idx) => {
+                    const isActive = h.annotation_id === activeAnnotationId;
 
-                        setContext({
-                          type: "text", // temporary, refined later
-                          page: h.page,
-                          text: "",
-                        });
+                    return (
+                      <div
+                        key={idx}
+                        onClick={async () => {
+                          setActiveAnnotationId(h.annotation_id);
+                          setChatMode("annotation");
 
-                        loadAnnotationChat(h.annotation_id);
-                      }}
-                      style={{
-                        position: "absolute",
-                        left: `${h.rect.x * 100}%`,
-                        top: `${h.rect.y * 100}%`,
-                        width: `${h.rect.width * 100}%`,
-                        height: `${h.rect.height * 100}%`,
-                        background: "rgba(255, 235, 59, 0.35)",
-                        border: "2px solid rgba(255, 193, 7, 0.9)",
-                        pointerEvents: "auto",
-                        zIndex: 5,
-                      }}
-                    />
-                  ))}
+                          const annotation = await fetchAnnotation(h.annotation_id);
+
+                          if (annotation.type === "region") {
+                            setContext({
+                              type: "image",
+                              region_id: annotation.region_id,
+                              document_id: annotation.document_id,
+                              page_number: annotation.page_number,
+                            });
+                          } else {
+                            setContext({
+                              type: "text",
+                              page: annotation.page_number,
+                              text: "",
+                            });
+                          }
+
+                          loadAnnotationChat(h.annotation_id);
+                        }}
+                        style={{
+                          position: "absolute",
+                          left: `${h.rect.x * 100}%`,
+                          top: `${h.rect.y * 100}%`,
+                          width: `${h.rect.width * 100}%`,
+                          height: `${h.rect.height * 100}%`,
+                          background: isActive
+                            ? "rgba(255, 235, 59, 0.35)"
+                            : "rgba(255, 235, 59, 0.18)",
+                          border: "none",
+                          pointerEvents: "auto",
+                          zIndex: 5,
+                        }}
+                      />
+                    );
+                  })}
 
                   {regionMode && activePage === pageNumber && (
                     <div
@@ -547,7 +660,28 @@ export default function Home() {
 
       {/* Chat Panel */}
       <div style={{ flex: 1, padding: "1rem", borderLeft: "1px solid #ccc", display: "flex", flexDirection: "column" }}>
-        <h3>Conversation</h3>
+        <h3>{activeFileTitle ?? "Conversation"}</h3>
+        {chatMode === "annotation" && (
+          <button
+            onClick={() => {
+              setChatMode("document");
+              setActiveAnnotationId(null);
+              setContext(null);
+            }}
+            style={{
+              marginBottom: "0.75rem",
+              alignSelf: "flex-start",
+              fontSize: "0.85rem",
+              background: "transparent",
+              border: "none",
+              color: "#1976d2",
+              cursor: "pointer",
+              padding: 0,
+            }}
+          >
+            ← Back to full conversation
+          </button>
+        )}
 
         <div style={{ flex: 1, overflowY: "auto", marginBottom: "1rem" }}>
           {messages.map((m, i) => (
@@ -556,8 +690,37 @@ export default function Home() {
               role={m.role}
               content={m.content}
               onClick={
-                m.role === "user" && m.reference
-                  ? () => scrollToPage(m.reference.page)
+                m.annotation_id
+                  ? async () => {
+                      // 1️⃣ Activate annotation
+                      setActiveAnnotationId(m.annotation_id);
+                      setChatMode("annotation");
+
+                      // 2️⃣ Fetch annotation metadata
+                      const annotation = await fetchAnnotation(m.annotation_id);
+
+                      // 3️⃣ Restore correct context
+                      if (annotation.type === "region") {
+                        setContext({
+                          type: "image",
+                          region_id: annotation.region_id,
+                          document_id: annotation.document_id,
+                          page_number: annotation.page_number,
+                        });
+                      } else {
+                        setContext({
+                          type: "text",
+                          page: annotation.page_number,
+                          text: "",
+                        });
+                      }
+
+                      // 4️⃣ Load annotation-specific chat
+                      loadAnnotationChat(m.annotation_id);
+
+                      // 5️⃣ Scroll to the page
+                      scrollToPage(annotation.page_number);
+                    }
                   : undefined
               }
             />
@@ -572,7 +735,7 @@ export default function Home() {
 
         <button
           onClick={askQuestion}
-          disabled={loading}
+          disabled={loading || (chatMode === "annotation" && !activeAnnotationId)}
           style={{ marginTop: "1rem" }}
         >
           {loading ? "Thinking..." : "Ask"}
