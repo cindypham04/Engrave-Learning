@@ -12,9 +12,27 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import base64
 import re
+import json
+import boto3
 from db import save_pages, get_pages, get_page_count
 from db import get_messages, save_message, get_annotation, get_messages_by_annotation, create_annotation, get_annotations_by_document
-from db import get_file, get_document_id_by_file, create_file
+from db import get_file, get_document_id_by_file
+from db import list_files, list_folders
+from s3 import upload_pdf
+from s3 import generate_presigned_url
+from io import BytesIO
+from db import (
+    begin,
+    commit,
+    rollback,
+    create_file,
+    update_file_s3_key,
+    rename_file,
+    commit,
+)
+
+
+
 
 # load_dotenv()  # Load OpenAI API key from .env file
 
@@ -36,35 +54,24 @@ app.add_middleware(
 ) 
 
 
-# Define where uploaded files will be stored
-UPLOAD_DIR = "uploads/documents"
-os.makedirs(UPLOAD_DIR, exist_ok=True) # create upload directory if not exists
-
 # Define where region images will be stored
 REGION_DIR = "uploads/regions"
 os.makedirs(REGION_DIR, exist_ok=True) # create image directory if not exists
 
-# Load PDF document and extract text from each page
-def extract_pages_from_pdf(document_id): 
-    file_path = os.path.join(UPLOAD_DIR, f"{document_id}.pdf")
 
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Document {document_id} not found.")
+def extract_pages_from_pdf_from_bytes(pdf_bytes: bytes, document_id: str):
+    pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-    pdf = fitz.open(file_path) # a PDF object is a list-like container of pages
-
-    pdf_cache = []
+    pages = []
 
     for idx, page in enumerate(pdf):
-        text = page.get_text() # extract text from each page
-        pdf_cache.append({
+        pages.append({
             "document_id": document_id,
             "page_number": idx + 1,
-            "text": text,
+            "text": page.get_text(),
         })
-
-    return pdf_cache
-
+        
+    return pages
 
 # Change shape of context: from [{"page_number":..., "text":...}] to "[page_number] text..."
 def reshape_pages(pages):
@@ -306,7 +313,7 @@ def ask_region(prompt_text, region_id, system_prompt=system_prompt):
 
 # Store annotation object
 class CreateAnnotation(BaseModel):
-    document_id: str
+    file_id: int
     page_number: int
     type: str
     geometry: Optional[dict] = None
@@ -314,48 +321,68 @@ class CreateAnnotation(BaseModel):
 
 # Store Ask Question objects
 class AskQuestion(BaseModel):
-    document_id: str
+    file_id: int
     annotation_id: Optional[int] = None
     question: str
 
-# Get the pdf file from frontend then write it into uploads
+# Change file title object
+class RenameFileRequest(BaseModel):
+    title: str
+
+# Get the pdf file from frontend then write it into S3
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-    # 1. Generate internal document_id
     document_id = str(uuid.uuid4())
-
-    # 2. Save PDF to disk (unchanged)
-    file_path = os.path.join(UPLOAD_DIR, f"{document_id}.pdf")
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    # 3. Extract and save pages (unchanged)
-    pages = extract_pages_from_pdf(document_id)
-    save_pages(pages)
-
-    # 4. Decide file title (temporary strategy)
     title = os.path.splitext(file.filename)[0]
+    user_id = 1  # temporary
 
-    # 5. Create file record (NEW)
-    file_id = create_file(
-        folder_id=None,        # root-level for now
-        document_id=document_id,
-        title=title,
-    )
+    pdf_bytes = await file.read()
 
-    # 6. Return both IDs (temporary)
-    return {
-        "file_id": file_id,
-        "document_id": document_id,  # will be removed later
-        "title": title,
-        "url": f"http://localhost:8000/files/{document_id}",
-    }
+    try:
+        # 1. Begin transaction
+        begin()
+
+        # 2. Create DB file row (no s3_key yet)
+        file_id = create_file(
+            folder_id=None,
+            document_id=document_id,
+            title=title,
+            user_id=user_id,
+        )
+
+        # 3. Upload to S3
+        s3_key = upload_pdf(
+            file_obj=BytesIO(pdf_bytes),
+            user_id=user_id,
+            file_id=file_id,
+        )
+
+        # 4. Update s3_key
+        update_file_s3_key(file_id, s3_key)
+
+        # 5. Commit transaction
+        commit()
+
+        return {
+            "file_id": file_id,
+            "title": title,
+        }
+
+    except Exception as e:
+        # Rollback everything
+        rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.post("/annotations")
 def create_text_annotation(payload: CreateAnnotation):
+    document_id = get_document_id_by_file(payload.file_id)
+    if not document_id:
+        raise HTTPException(status_code=404, detail="File not found")
+
     annotation_id = create_annotation(
-        document_id=payload.document_id,
+        document_id=document_id,
         page_number=payload.page_number,
         type=payload.type,
         geometry=payload.geometry,
@@ -371,6 +398,7 @@ def get_file_metadata(file_id: int):
         raise HTTPException(status_code=404, detail="File not found")
     return file
 
+
 @app.get("/files/{file_id}/state")
 def get_file_state(file_id: int):
     # 1. Get file metadata
@@ -384,8 +412,12 @@ def get_file_state(file_id: int):
     messages = get_messages(document_id)
     annotations = get_annotations_by_document(document_id)
 
-    # 3. Build PDF URL
-    pdf_url = f"http://localhost:8000/files/{document_id}"
+    # 3. Build PDF URL from S3
+    if not file["s3_key"]:
+        raise HTTPException(status_code=500, detail="File missing s3_key")
+
+    pdf_url = generate_presigned_url(file["s3_key"])
+
 
     # 4. Return unified state
     return {
@@ -400,18 +432,25 @@ def get_file_state(file_id: int):
     }
 
 
-# Return document to frontend
-@app.get("/files/{document_id}")
-def get_pdf_file(document_id: str):
-    return FileResponse(
-        path=os.path.join(UPLOAD_DIR,  f"{document_id}.pdf"),
-        media_type="application/pdf"
-    )
-
 # Get the image region from frontend
 @app.post("/upload-region")
-def upload_region(document_id: str = Form(...), page_number: int = Form(...), region: UploadFile = File(...)):
+def upload_region(
+    file_id: str = Form(...),
+    page_number: int = Form(...),
+    geometry: Optional[str] = Form(None),          
+    region: UploadFile = File(...)
+):
     region_id = str(uuid.uuid4())
+
+    document_id = get_document_id_by_file(file_id)
+    if not document_id:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # Parse geometry
+    try:
+        normalized_geometry = json.loads(geometry)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid geometry payload")
 
     allowed_img_type = {"image/jpeg", "image/png"}
 
@@ -420,22 +459,22 @@ def upload_region(document_id: str = Form(...), page_number: int = Form(...), re
             status_code=400,
             detail=f"Invalid file type: {region.content_type}."
         )
-    
+
     # Decide extension based on content type
     ext = ".png" if region.content_type == "image/png" else ".jpeg"
     filename = f"{region_id}{ext}"
 
     # Save region image to disk
     file_path = os.path.join(REGION_DIR, filename)
-
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(region.file, buffer)
 
+    # Store geometry with annotation
     annotation_id = create_annotation(
         document_id=document_id,
         page_number=page_number,
         type="region",
-        geometry=None,
+        geometry=normalized_geometry,
         region_id=region_id,
     )
 
@@ -447,19 +486,25 @@ def upload_region(document_id: str = Form(...), page_number: int = Form(...), re
         "url": f"http://localhost:8000/regions/{region_id}",
     }
 
+
 # Get question from frontend
 @app.post("/ask")
 def ask_document(req: AskQuestion):
 
     # Example of pages = [{"page_number": ..., "text": ...}]
-    pages = get_pages(req.document_id)
+    document_id = get_document_id_by_file(req.file_id)
+    if not document_id:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    pages = get_pages(document_id)
+
 
     if not pages:
         return {"answer": "Document not found."}
     
     # Save user message first
     save_message(
-        document_id = req.document_id,
+        document_id = document_id,
         role = "user",
         content = req.question,
         annotation_id = req.annotation_id,
@@ -472,7 +517,7 @@ def ask_document(req: AskQuestion):
         if not annotation:
             raise HTTPException(status_code=404, detail="Annotation not found")
 
-        if annotation["document_id"] != req.document_id:
+        if annotation["document_id"] != document_id:
             raise HTTPException(status_code=400, detail="Annotation mismatch")
 
         page_idx = annotation["page_number"] - 1
@@ -522,7 +567,7 @@ Question:
         answer = normalize_math(answer)
 
         save_message(
-            document_id=req.document_id,
+            document_id=document_id,
             role="assistant",
             content=answer,
             annotation_id=req.annotation_id,
@@ -544,14 +589,13 @@ Question:
     answer = normalize_math(answer)
 
     save_message(
-        document_id=req.document_id,
+        document_id=document_id,
         role="assistant",
         content=answer,
         annotation_id=None,
     )
 
     return {"answer": answer}
-
 
 # Get region image from /regions
 @app.get("/regions/{region_id}")
@@ -570,8 +614,12 @@ def get_region(region_id: str):
         detail=f"Region image {region_id} not found."
     )
 
-@app.get("/chat/{document_id}")
-def get_chat(document_id: str):
+@app.get("/chat/file/{file_id}")
+def get_chat(file_id: int):
+    document_id = get_document_id_by_file(file_id)
+    if not document_id:
+        raise HTTPException(status_code=404, detail="File not found")
+
     return {"messages": get_messages(document_id)}
 
 
@@ -590,11 +638,34 @@ def fetch_annotation(annotation_id: int):
 
     return annotation
 
-@app.get("/annotations/document/{document_id}")
-def get_document_annotations(document_id: str):
+@app.get("/annotations/file/{file_id}")
+def get_document_annotations(file_id: int):
+    document_id = get_document_id_by_file(file_id)
+    if not document_id:
+        raise HTTPException(status_code=404, detail="File not found")
+
     return {
         "annotations": get_annotations_by_document(document_id)
     }
+
+
+@app.get("/folders")
+def get_folders():
+    return {"folders": list_folders(user_id=1)}
+
+@app.get("/files")
+def get_files():
+    return {"files": list_files(user_id=1)}
+
+@app.patch("/files/{file_id}/rename")
+def rename_file_endpoint(file_id: int, payload: RenameFileRequest):
+    success = rename_file(file_id, payload.title)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    commit()
+    return {"ok": True}
 
 # Debug route 
 @app.get("/debug/page_count")

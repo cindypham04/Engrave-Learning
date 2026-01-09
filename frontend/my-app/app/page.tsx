@@ -40,7 +40,6 @@ type TextContext = {
 type ImageContext = {
   type: "image";
   region_id: string;
-  document_id: string;
   page_number: number;
 };
 
@@ -77,7 +76,6 @@ type Highlight = {
 
 export default function Home() {
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
-  const [documentId, setDocumentId] = useState<string | null>(null);
   const [numPages, setNumPages] = useState(0);
 
   const [context, setContext] = useState<Context | null>(null);
@@ -118,7 +116,17 @@ export default function Home() {
   const [folders, setFolders] = useState<any[]>([]);
   const [files, setFiles] = useState<any[]>([]);
 
+  // File title (stay on top of chat panel) state
   const [activeFileTitle, setActiveFileTitle] = useState<string | null>(null);
+
+  // PDF scaler state
+  const [pdfScale, setPdfScale] = useState(1.2);
+
+  // Chat width state
+  const [chatWidth, setChatWidth] = useState(32); // percent
+  const [isResizing, setIsResizing] = useState(false);
+
+  // Rename state
 
     // ---------- load sidebar data (ONCE) ----------
   useEffect(() => {
@@ -136,6 +144,32 @@ export default function Home() {
     if (!activeFileId) return;
     loadFileState(activeFileId);
   }, [activeFileId]);
+
+  useEffect(() => {
+    function handleMouseMove(e: MouseEvent) {
+      if (!isResizing) return;
+
+      const percent = (e.clientX / window.innerWidth) * 100;
+
+      // Clamp so it never becomes unusable
+      const clamped = Math.min(60, Math.max(20, 100 - percent));
+
+      setChatWidth(clamped);
+    }
+
+    function handleMouseUp() {
+      setIsResizing(false);
+    }
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, [isResizing]);
+
   
 
   /* ---------------- Helpers ---------------- */
@@ -182,10 +216,6 @@ export default function Home() {
 
     setActiveFileTitle(data.file.title);
 
-    setDocumentId(
-      data.pdf_url.split("/").pop() // extract document_id
-    );
-
     const restoredHighlights = (data.annotations || [])
       .filter((a: any) => a.geometry)
       .map((a: any) => ({
@@ -220,6 +250,30 @@ export default function Home() {
     setQuestion("");
 
   }
+
+  /* ---------------- Rename PDF File ---------------- */
+  async function renameFile(fileId: number, newTitle: string) {
+    if (!newTitle.trim()) return;
+
+    await fetch(`http://localhost:8000/files/${fileId}/rename`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: newTitle }),
+    });
+
+    // Update sidebar state
+    setFiles(prev =>
+      prev.map(f =>
+        f.id === fileId ? { ...f, title: newTitle } : f
+      )
+    );
+
+    // Update header if this file is active
+    if (activeFileId === fileId) {
+      setActiveFileTitle(newTitle);
+    }
+  }
+
 
   /* ---------------- Text selection ---------------- */
 
@@ -288,7 +342,7 @@ export default function Home() {
     rect: DragRect,
     pageContainer: HTMLElement
   ) {
-    if (!documentId) return;
+    if (!activeFileId) return;
 
     const pageWidth = pageContainer.clientWidth;
     const pageHeight = pageContainer.clientHeight;
@@ -330,8 +384,9 @@ export default function Home() {
 
     const formData = new FormData();
     formData.append("region", blob);
-    formData.append("document_id", documentId);
+    formData.append("file_id", String(activeFileId));
     formData.append("page_number", String(pageNumber));
+    formData.append("geometry", JSON.stringify(normalizedRect));
 
     const res = await fetch("http://localhost:8000/upload-region", {
       method: "POST",
@@ -354,7 +409,6 @@ export default function Home() {
     setContext({
       type: "image",
       region_id: data.region_id,
-      document_id: documentId,
       page_number: pageNumber,
     });
   }
@@ -362,7 +416,7 @@ export default function Home() {
   /* ---------------- Ask backend ---------------- */
 
   async function askQuestion() {
-    if (!documentId) return;
+    if (!activeFileId) return;
 
     const page =
       context?.type === "text"
@@ -384,35 +438,12 @@ export default function Home() {
     setQuestion("");
     setLoading(true);
 
-    // 🟡 Phase 2.3 (text): convert rect → highlight
-    if (context?.type === "text" && pendingTextRectRef.current && page) {
-      const pageEl = pageRefs.current[page];
-      if (pageEl) {
-        const r = pageEl.getBoundingClientRect();
-        const rect = pendingTextRectRef.current;
-
-        setHighlights(prev => [
-          ...prev,
-          {
-            page,
-            annotation_id: activeAnnotationId!, // 👈 ADD
-            rect: {
-              x: (rect.left - r.left) / r.width,
-              y: (rect.top - r.top) / r.height,
-              width: rect.width / r.width,
-              height: rect.height / r.height,
-            },
-          },
-        ]);
-      }
-      pendingTextRectRef.current = null;
-    }
 
     const res = await fetch("http://localhost:8000/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        document_id: documentId,
+        file_id: activeFileId,
         annotation_id: activeAnnotationId,
         question: userMsg.content,
       }),
@@ -463,7 +494,13 @@ export default function Home() {
 
 
       {/* PDF Viewer */}
-      <div style={{ flex: 2, padding: "1rem", overflow: "auto" }}>
+      <div
+        style={{
+          width: `${100 - chatWidth}%`,
+          padding: "1rem",
+          overflow: "auto",
+        }}
+      >
         <input type="file" accept="application/pdf" onChange={handleUpload} />
         <button
           onClick={() => setSidebarOpen(v => !v)}
@@ -474,6 +511,20 @@ export default function Home() {
         >
           {sidebarOpen ? "Hide files" : "Show files"}
         </button>
+        <div style={{ marginBottom: "0.5rem" }}>
+          <label style={{ fontSize: "0.85rem" }}>
+            Zoom: {Math.round(pdfScale * 100)}%
+          </label>
+          <input
+            type="range"
+            min={0.6}
+            max={2}
+            step={0.05}
+            value={pdfScale}
+            onChange={(e) => setPdfScale(Number(e.target.value))}
+            style={{ width: "100%" }}
+          />
+        </div>
 
         {pdfUrl && (
           <Document file={pdfUrl} onLoadSuccess={({ numPages }) => setNumPages(numPages)}>
@@ -491,55 +542,49 @@ export default function Home() {
                     setActivePage(pageNumber);
                     setDragRect(null);
                   }}
-                  style={{ position: "relative", marginBottom: "1.5rem" }}
+                  style={{
+                    position: "relative",
+                    marginBottom: "1.5rem",
+                    display: "inline-block", 
+                  }}
                 >
-                  <Page pageNumber={pageNumber} renderTextLayer renderAnnotationLayer={false} />
+                  <Page
+                    pageNumber={pageNumber}
+                    scale={pdfScale}
+                    renderTextLayer
+                    renderAnnotationLayer={false}
+                  />
 
-                  {pageHighlights.map((h, idx) => {
-                    const isActive = h.annotation_id === activeAnnotationId;
+                  {/* ✅ Highlight overlay that resizes with the page */}
+                  <div
+                    style={{
+                      position: "absolute",
+                      inset: 0,
+                      pointerEvents: "none",
+                      zIndex: 5,
+                    }}
+                  >
+                    {pageHighlights.map(h => {
+                      const isActive = h.annotation_id === activeAnnotationId;
 
-                    return (
-                      <div
-                        key={idx}
-                        onClick={async () => {
-                          setActiveAnnotationId(h.annotation_id);
-                          setChatMode("annotation");
-
-                          const annotation = await fetchAnnotation(h.annotation_id);
-
-                          if (annotation.type === "region") {
-                            setContext({
-                              type: "image",
-                              region_id: annotation.region_id,
-                              document_id: annotation.document_id,
-                              page_number: annotation.page_number,
-                            });
-                          } else {
-                            setContext({
-                              type: "text",
-                              page: annotation.page_number,
-                              text: "",
-                            });
-                          }
-
-                          loadAnnotationChat(h.annotation_id);
-                        }}
-                        style={{
-                          position: "absolute",
-                          left: `${h.rect.x * 100}%`,
-                          top: `${h.rect.y * 100}%`,
-                          width: `${h.rect.width * 100}%`,
-                          height: `${h.rect.height * 100}%`,
-                          background: isActive
-                            ? "rgba(255, 235, 59, 0.35)"
-                            : "rgba(255, 235, 59, 0.18)",
-                          border: "none",
-                          pointerEvents: "auto",
-                          zIndex: 5,
-                        }}
-                      />
-                    );
-                  })}
+                      return (
+                        <div
+                          key={h.annotation_id}
+                          style={{
+                            position: "absolute",
+                            left: `${h.rect.x * 100}%`,
+                            top: `${h.rect.y * 100}%`,
+                            width: `${h.rect.width * 100}%`,
+                            height: `${h.rect.height * 100}%`,
+                            background: isActive
+                              ? "rgba(0,112,243,0.15)"
+                              : "rgba(255, 235, 59, 0.18)",
+                            borderRadius: "2px",
+                          }}
+                        />
+                      );
+                    })}
+                  </div>
 
                   {regionMode && activePage === pageNumber && (
                     <div
@@ -603,30 +648,33 @@ export default function Home() {
           <div
             ref={popupRef}
             onMouseDown={async () => {
-              if (!pendingTextRef.current || !documentId) return;
+              if (!pendingTextRef.current || !activeFileId) return;
 
+              // Type narrow ONCE, explicitly
               const ctx = pendingTextRef.current;
+              if (ctx.type !== "text") return;
 
               const rect = pendingTextRectRef.current;
               const pageEl = pageRefs.current[ctx.page];
 
-              let geometry = null;
+              if (!rect || !pageEl) return;
 
-              if (rect && pageEl) {
-                const pageRect = pageEl.getBoundingClientRect();
-                geometry = {
-                  x: (rect.left - pageRect.left) / pageRect.width,
-                  y: (rect.top - pageRect.top) / pageRect.height,
-                  width: rect.width / pageRect.width,
-                  height: rect.height / pageRect.height,
-                };
-              }
+              const pageRect = pageEl.getBoundingClientRect();
 
+              // Normalized geometry (page-relative)
+              const geometry = {
+                x: (rect.left - pageRect.left) / pageRect.width,
+                y: (rect.top - pageRect.top) / pageRect.height,
+                width: rect.width / pageRect.width,
+                height: rect.height / pageRect.height,
+              };
+
+              // Create annotation (source of truth)
               const res = await fetch("http://localhost:8000/annotations", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
-                  document_id: documentId,
+                  file_id: activeFileId,
                   page_number: ctx.page,
                   type: "text",
                   geometry,
@@ -635,13 +683,26 @@ export default function Home() {
               });
 
               const data = await res.json();
+
+              // Create highlight at annotation creation time
+              setHighlights(prev => [
+                ...prev,
+                {
+                  page: ctx.page,
+                  annotation_id: data.annotation_id,
+                  rect: geometry,
+                },
+              ]);
+
+              // Enter annotation chat context
               setActiveAnnotationId(data.annotation_id);
               setContext(ctx);
 
+              // Cleanup transient state
               pendingTextRef.current = null;
+              pendingTextRectRef.current = null;
               hidePopup();
             }}
-
             style={{
               position: "absolute",
               display: "none",
@@ -658,15 +719,42 @@ export default function Home() {
         )}
       </div>
 
+      {/* Resize Handle */}
+        <div
+          onMouseDown={() => setIsResizing(true)}
+          style={{
+            width: "6px",
+            cursor: "col-resize",
+            background: "#e0e0e0",
+            userSelect: "none",
+          }}
+        />
+
       {/* Chat Panel */}
-      <div style={{ flex: 1, padding: "1rem", borderLeft: "1px solid #ccc", display: "flex", flexDirection: "column" }}>
+      <div
+        style={{
+          width: `${chatWidth}%`,
+          padding: "1rem",
+          borderLeft: "1px solid #ccc",
+          display: "flex",
+          flexDirection: "column",
+        }}
+      >
         <h3>{activeFileTitle ?? "Conversation"}</h3>
         {chatMode === "annotation" && (
           <button
-            onClick={() => {
+            onClick={async () => {
               setChatMode("document");
               setActiveAnnotationId(null);
               setContext(null);
+
+              if (!activeFileId) return;
+
+              const res = await fetch(
+                `http://localhost:8000/chat/file/${activeFileId}`
+              );
+              const data = await res.json();
+              setMessages(data.messages || []);
             }}
             style={{
               marginBottom: "0.75rem",
@@ -704,7 +792,6 @@ export default function Home() {
                         setContext({
                           type: "image",
                           region_id: annotation.region_id,
-                          document_id: annotation.document_id,
                           page_number: annotation.page_number,
                         });
                       } else {

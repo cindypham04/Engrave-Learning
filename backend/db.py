@@ -4,38 +4,47 @@ import json
 
 DB_PATH = "data.db"
 
+
+# One shared connection, many cursors (this is OK)
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-cursor = conn.cursor()
+
+conn.execute("PRAGMA foreign_keys = ON")
+
+def get_cursor():
+    return conn.cursor()
+
 
 # ======================================================
 # Pages
 # ======================================================
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS pages (
-    document_id TEXT,
-    page_number INTEGER,
-    text TEXT,
-    PRIMARY KEY (document_id, page_number)
-)
-""")
-conn.commit()
+def init_pages():
+    cur = get_cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS pages (
+        document_id TEXT,
+        page_number INTEGER,
+        text TEXT,
+        PRIMARY KEY (document_id, page_number)
+    )
+    """)
 
 
 def save_pages(pages):
+    cur = get_cursor()
     for page in pages:
-        cursor.execute(
+        cur.execute(
             """
             INSERT OR REPLACE INTO pages (document_id, page_number, text)
             VALUES (?, ?, ?)
             """,
             (page["document_id"], page["page_number"], page["text"])
         )
-    conn.commit()
 
 
 def get_pages(document_id):
-    cursor.execute(
+    cur = get_cursor()
+    cur.execute(
         """
         SELECT page_number, text
         FROM pages
@@ -44,54 +53,37 @@ def get_pages(document_id):
         """,
         (document_id,)
     )
-    return [{"page_number": r[0], "text": r[1]} for r in cursor.fetchall()]
+    return [{"page_number": r[0], "text": r[1]} for r in cur.fetchall()]
 
 
 def get_page_count():
-    cursor.execute("SELECT COUNT(*) FROM pages")
-    return cursor.fetchone()[0]
+    cur = get_cursor()
+    cur.execute("SELECT COUNT(*) FROM pages")
+    return cur.fetchone()[0]
 
 
 # ======================================================
 # Messages
 # ======================================================
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    document_id TEXT NOT NULL,
-    role TEXT NOT NULL,
-    content TEXT NOT NULL,
-    annotation_id INTEGER,
-    reference TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)
-""")
-conn.commit()
-
-
-def ensure_reference_column():
-    cursor.execute("PRAGMA table_info(messages)")
-    columns = [row[1] for row in cursor.fetchall()]
-    if "reference" not in columns:
-        cursor.execute("ALTER TABLE messages ADD COLUMN reference TEXT")
-        conn.commit()
-
-
-def ensure_annotation_id_column():
-    cursor.execute("PRAGMA table_info(messages)")
-    columns = [row[1] for row in cursor.fetchall()]
-    if "annotation_id" not in columns:
-        cursor.execute("ALTER TABLE messages ADD COLUMN annotation_id INTEGER")
-        conn.commit()
-
-
-ensure_reference_column()
-ensure_annotation_id_column()
+def init_messages():
+    cur = get_cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        document_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        annotation_id INTEGER,
+        reference TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
 
 
 def save_message(document_id, role, content, annotation_id=None, reference=None):
-    cursor.execute(
+    cur = get_cursor()
+    cur.execute(
         """
         INSERT INTO messages (document_id, role, content, annotation_id, reference)
         VALUES (?, ?, ?, ?, ?)
@@ -104,11 +96,11 @@ def save_message(document_id, role, content, annotation_id=None, reference=None)
             json.dumps(reference) if reference else None,
         )
     )
-    conn.commit()
 
 
 def get_messages(document_id):
-    cursor.execute(
+    cur = get_cursor()
+    cur.execute(
         """
         SELECT role, content, annotation_id, reference
         FROM messages
@@ -124,12 +116,13 @@ def get_messages(document_id):
             "annotation_id": r[2],
             "reference": json.loads(r[3]) if r[3] else None,
         }
-        for r in cursor.fetchall()
+        for r in cur.fetchall()
     ]
 
 
 def get_messages_by_annotation(annotation_id):
-    cursor.execute(
+    cur = get_cursor()
+    cur.execute(
         """
         SELECT role, content, annotation_id
         FROM messages
@@ -139,54 +132,37 @@ def get_messages_by_annotation(annotation_id):
         (annotation_id,)
     )
     return [
-        {
-            "role": r[0],
-            "content": r[1],
-            "annotation_id": r[2],
-        }
-        for r in cursor.fetchall()
+        {"role": r[0], "content": r[1], "annotation_id": r[2]}
+        for r in cur.fetchall()
     ]
+
 
 # ======================================================
 # Annotations
 # ======================================================
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS annotations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    document_id TEXT NOT NULL,
-    page_number INTEGER NOT NULL,
-    type TEXT NOT NULL,
-    geometry TEXT,
-    text TEXT,
-    region_id TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)
-""")
-conn.commit()
-
-
-def ensure_region_id_column():
-    cursor.execute("PRAGMA table_info(annotations)")
-    columns = [row[1] for row in cursor.fetchall()]
-    if "region_id" not in columns:
-        cursor.execute("ALTER TABLE annotations ADD COLUMN region_id TEXT")
-        conn.commit()
-
-
-ensure_region_id_column()
+def init_annotations():
+    cur = get_cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS annotations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        document_id TEXT NOT NULL,
+        page_number INTEGER NOT NULL,
+        type TEXT NOT NULL,
+        geometry TEXT,
+        text TEXT,
+        region_id TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
 
 
 def create_annotation(document_id, page_number, type, geometry, text=None, region_id=None):
-    cursor.execute(
+    cur = get_cursor()
+    cur.execute(
         """
         INSERT INTO annotations (
-            document_id,
-            page_number,
-            type,
-            geometry,
-            text,
-            region_id
+            document_id, page_number, type, geometry, text, region_id
         )
         VALUES (?, ?, ?, ?, ?, ?)
         """,
@@ -199,12 +175,12 @@ def create_annotation(document_id, page_number, type, geometry, text=None, regio
             region_id,
         )
     )
-    conn.commit()
-    return cursor.lastrowid
+    return cur.lastrowid
 
 
 def get_annotation(annotation_id):
-    cursor.execute(
+    cur = get_cursor()
+    cur.execute(
         """
         SELECT id, document_id, page_number, type, geometry, text, region_id
         FROM annotations
@@ -212,7 +188,7 @@ def get_annotation(annotation_id):
         """,
         (annotation_id,)
     )
-    row = cursor.fetchone()
+    row = cur.fetchone()
     if not row:
         return None
 
@@ -227,9 +203,9 @@ def get_annotation(annotation_id):
     }
 
 
-
 def get_annotations_by_document(document_id):
-    cursor.execute(
+    cur = get_cursor()
+    cur.execute(
         """
         SELECT id, page_number, type, geometry, text, region_id, created_at
         FROM annotations
@@ -248,107 +224,104 @@ def get_annotations_by_document(document_id):
             "region_id": r[5],
             "created_at": r[6],
         }
-        for r in cursor.fetchall()
+        for r in cur.fetchall()
     ]
 
 
-def get_annotations_by_page(document_id, page_number):
-    cursor.execute(
-        """
-        SELECT id, type, geometry, region_id, created_at
-        FROM annotations
-        WHERE document_id = ? AND page_number = ?
-        ORDER BY created_at ASC
-        """,
-        (document_id, page_number)
-    )
-    return [
-        {
-            "id": r[0],
-            "type": r[1],
-            "geometry": json.loads(r[2]) if r[2] else None,
-            "region_id": r[3],
-            "created_at": r[4],
-        }
-        for r in cursor.fetchall()
-    ]
-
 # ======================================================
-# Folders
+# Users, Folders, Files
 # ======================================================
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS folders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)
-""")
-conn.commit()
-
-def create_folder(name: str):
-    cursor.execute(
-        "INSERT INTO folders (name) VALUES (?)",
-        (name,)
+def init_users():
+    cur = get_cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
-    conn.commit()
-    return cursor.lastrowid
+    """)
 
-def list_folders():
-    cursor.execute(
+    # seed user 1
+    cur.execute("SELECT id FROM users WHERE id = 1")
+    if not cur.fetchone():
+        cur.execute("INSERT INTO users (id, email) VALUES (1, 'demo@local')")
+
+
+def init_folders():
+    cur = get_cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS folders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        user_id INTEGER NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+
+def init_files():
+    cur = get_cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        folder_id INTEGER,
+        document_id TEXT NOT NULL UNIQUE,
+        title TEXT,
+        s3_key TEXT,
+        user_id INTEGER NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (folder_id) REFERENCES folders(id)
+    )
+    """)
+
+
+def create_folder(name: str, user_id: int):
+    cur = get_cursor()
+    cur.execute(
+        "INSERT INTO folders (name, user_id) VALUES (?, ?)",
+        (name, user_id)
+    )
+    return cur.lastrowid
+
+
+def list_folders(user_id=1):
+    cur = get_cursor()
+    cur.execute(
         """
         SELECT id, name, created_at
         FROM folders
+        WHERE user_id = ?
         ORDER BY created_at ASC
-        """)
-    return [
-        {
-            "id": r[0],
-            "name": r[1],
-            "created_at": r[2],
-        }
-        for r in cursor.fetchall()
-    ]
-
-
-# ======================================================
-# Files
-# ======================================================
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS files (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    folder_id INTEGER,
-    document_id TEXT NOT NULL UNIQUE,
-    title TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (folder_id) REFERENCES folders(id)
-)
-""")
-conn.commit()
-
-def create_file(folder_id: int | None, document_id: str, title: str):
-    cursor.execute(
-        """
-        INSERT INTO files (folder_id, document_id, title)
-        VALUES (?, ?, ?)
         """,
-        (folder_id, document_id, title)
+        (user_id,)
     )
-    conn.commit()
-    return cursor.lastrowid
+    return [{"id": r[0], "name": r[1], "created_at": r[2]} for r in cur.fetchall()]
 
-# Helper: get file by id
-def get_file(file_id: int):
-    cursor.execute(
+
+def create_file(folder_id, document_id, title, user_id):
+    cur = get_cursor()
+    cur.execute(
         """
-        SELECT id, folder_id, document_id, title, created_at
+        INSERT INTO files (folder_id, document_id, title, user_id)
+        VALUES (?, ?, ?, ?)
+        """,
+        (folder_id, document_id, title, user_id)
+    )
+    return cur.lastrowid
+
+
+def get_file(file_id):
+    cur = get_cursor()
+    cur.execute(
+        """
+        SELECT id, folder_id, document_id, title, s3_key, created_at
         FROM files
         WHERE id = ?
         """,
         (file_id,)
     )
-    row = cursor.fetchone()
+    row = cur.fetchone()
     if not row:
         return None
 
@@ -357,36 +330,74 @@ def get_file(file_id: int):
         "folder_id": row[1],
         "document_id": row[2],
         "title": row[3],
-        "created_at": row[4],
+        "s3_key": row[4],
+        "created_at": row[5],
     }
 
-# Helper: resolve document_id from file_id
-def get_document_id_by_file(file_id: int) -> str | None:
-    cursor.execute(
+
+def list_files(user_id=1):
+    cur = get_cursor()
+    cur.execute(
         """
-        SELECT document_id
+        SELECT id, folder_id, title, s3_key, created_at
         FROM files
-        WHERE id = ?
+        WHERE user_id = ?
+        ORDER BY created_at DESC
         """,
-        (file_id,)
+        (user_id,)
     )
-    row = cursor.fetchone()
+    return [{"id": r[0], "folder_id": r[1], "title": r[2], "created_at": r[4]} for r in cur.fetchall()]
+
+
+def update_file_s3_key(file_id, s3_key):
+    cur = get_cursor()
+    cur.execute(
+        "UPDATE files SET s3_key = ? WHERE id = ?",
+        (s3_key, file_id)
+    )
+
+
+def get_document_id_by_file(file_id):
+    cur = get_cursor()
+    cur.execute("SELECT document_id FROM files WHERE id = ?", (file_id,))
+    row = cur.fetchone()
     return row[0] if row else None
 
-# Helper: list files (for sidebar)
-def list_files():
-    cursor.execute(
+def rename_file(file_id: int, new_title: str):
+    cur = get_cursor()
+    cur.execute(
         """
-        SELECT id, folder_id, title, created_at
-        FROM files
-        ORDER BY created_at DESC
-        """)
-    return [
-        {
-            "id": r[0],
-            "folder_id": r[1],
-            "title": r[2],
-            "created_at": r[3],
-        }
-        for r in cursor.fetchall()
-    ]
+        UPDATE files
+        SET title = ?
+        WHERE id = ?
+        """,
+        (new_title, file_id),
+    )
+
+    if cur.rowcount == 0:
+        return False
+
+    return True
+
+
+
+# ======================================================
+# Init everything ONCE
+# ======================================================
+
+init_pages()
+init_messages()
+init_annotations()
+init_users()
+init_folders()
+init_files()
+
+def begin():
+    cursor = get_cursor()
+    cursor.execute("BEGIN")
+
+def rollback():
+    conn.rollback()
+
+def commit():
+    conn.commit()
