@@ -127,6 +127,9 @@ export default function Home() {
   const [isResizing, setIsResizing] = useState(false);
 
   // Rename state
+  const [renamingFileId, setRenamingFileId] = useState<number | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+
 
     // ---------- load sidebar data (ONCE) ----------
   useEffect(() => {
@@ -273,6 +276,37 @@ export default function Home() {
       setActiveFileTitle(newTitle);
     }
   }
+
+    /* ---------------- Delete PDF File ---------------- */
+  async function deleteFile(fileId: number) {
+    const ok = confirm("Delete this file permanently?");
+    if (!ok) return;
+
+    const res = await fetch(`http://localhost:8000/files/${fileId}`, {
+      method: "DELETE",
+    });
+
+    if (!res.ok) {
+      alert("Failed to delete file");
+      return;
+    }
+
+    // Remove from sidebar
+    setFiles(prev => prev.filter(f => f.id !== fileId));
+
+    // If deleting the active file, clear UI state
+    if (activeFileId === fileId) {
+      setActiveFileId(null);
+      setPdfUrl(null);
+      setMessages([]);
+      setHighlights([]);
+      setContext(null);
+      setActiveAnnotationId(null);
+      setActiveFileTitle(null);
+      setChatMode("document");
+    }
+  }
+
 
 
   /* ---------------- Text selection ---------------- */
@@ -470,26 +504,59 @@ export default function Home() {
           transition: "width 0.2s ease",
         }}
       >
-        {sidebarOpen &&
-          Array.isArray(files) &&
-          files.map(file => (
-            <div
-              key={file.id}
-              onClick={() => {
-                setActiveFileId(file.id);
-                setChatMode("document");
-                setActiveAnnotationId(null);
-                setContext(null);
-              }}
-              style={{
-                padding: "8px",
-                cursor: "pointer",
-                background: file.id === activeFileId ? "#222" : "transparent",
-              }}
-            >
-              {file.title}
-            </div>
-          ))}
+        {files.map(file => (
+          <div
+            key={file.id}
+            style={{
+              padding: "8px",
+              cursor: "pointer",
+              background: file.id === activeFileId ? "#222" : "transparent",
+            }}
+            onDoubleClick={() => {
+              setRenamingFileId(file.id);
+              setRenameValue(file.title);
+            }}
+            onClick={() => {
+              if (renamingFileId === file.id) return;
+
+              setRenamingFileId(null);
+              setActiveFileId(file.id);
+              setChatMode("document");
+              setActiveAnnotationId(null);
+              setContext(null);
+            }}
+          >
+            {renamingFileId === file.id ? (
+              <input
+                autoFocus
+                value={renameValue}
+                onChange={e => setRenameValue(e.target.value)}
+                onBlur={async () => {
+                  await renameFile(file.id, renameValue);
+                  setRenamingFileId(null);
+                }}
+                onKeyDown={async e => {
+                  if (e.key === "Enter") {
+                    await renameFile(file.id, renameValue);
+                    setRenamingFileId(null);
+                  }
+                  if (e.key === "Escape") {
+                    setRenamingFileId(null);
+                  }
+                }}
+                style={{
+                  width: "100%",
+                  background: "#111",
+                  color: "#fff",
+                  border: "1px solid #555",
+                }}
+              />
+            ) : (
+              file.title
+            )}
+          </div>
+        ))}
+
         </div>
 
 
