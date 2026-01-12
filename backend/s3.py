@@ -40,6 +40,22 @@ def upload_pdf(file_obj, user_id: int, file_id: int) -> str:
     return key
 
 
+def upload_region_to_s3(file_obj, user_id: int, region_id: str, content_type: str, ext: str,) -> str:
+    """
+    Upload a region image to S3 and return object key
+    """
+    key = f"users/user_{user_id}/regions/{region_id}{ext}"
+
+    s3.upload_fileobj(
+        Fileobj=file_obj,
+        Bucket=BUCKET,
+        Key=key,
+        ExtraArgs={"ContentType": content_type},
+    )
+
+    return key
+
+
 def generate_presigned_url(s3_key: str, expires_in: int = 3600) -> str:
     """
     Generate a temporary download URL for a PDF
@@ -52,3 +68,4 @@ def generate_presigned_url(s3_key: str, expires_in: int = 3600) -> str:
         },
         ExpiresIn=expires_in,
     )
+

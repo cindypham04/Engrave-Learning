@@ -18,7 +18,7 @@ from db import save_pages, get_pages, get_page_count
 from db import get_messages, save_message, get_annotation, get_messages_by_annotation, create_annotation, get_annotations_by_document
 from db import get_file, get_document_id_by_file
 from db import list_files, list_folders
-from s3 import upload_pdf
+from s3 import upload_pdf, upload_region_to_s3
 from s3 import generate_presigned_url
 from io import BytesIO
 from db import (
@@ -29,6 +29,7 @@ from db import (
     update_file_s3_key,
     rename_file,
     commit,
+    delete_file_cascade,
 )
 
 
@@ -434,7 +435,7 @@ def get_file_state(file_id: int):
 
 # Get the image region from frontend
 @app.post("/upload-region")
-def upload_region(
+def upload_region_endpoint(
     file_id: str = Form(...),
     page_number: int = Form(...),
     geometry: Optional[str] = Form(None),          
@@ -464,10 +465,16 @@ def upload_region(
     ext = ".png" if region.content_type == "image/png" else ".jpeg"
     filename = f"{region_id}{ext}"
 
-    # Save region image to disk
-    file_path = os.path.join(REGION_DIR, filename)
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(region.file, buffer)
+    ext = ".png" if region.content_type == "image/png" else ".jpeg"
+
+    region_s3_key = upload_region_to_s3(
+        file_obj=region.file,
+        user_id=1,
+        region_id=region_id,
+        ext=ext,
+    )
+
+
 
     # Store geometry with annotation
     annotation_id = create_annotation(
@@ -476,6 +483,7 @@ def upload_region(
         type="region",
         geometry=normalized_geometry,
         region_id=region_id,
+        region_s3_key=region_s3_key,
     )
 
     return {
@@ -666,6 +674,12 @@ def rename_file_endpoint(file_id: int, payload: RenameFileRequest):
 
     commit()
     return {"ok": True}
+
+@app.delete("/files/{file_id}")
+def delete_file(file_id: int):
+    delete_file_cascade(file_id)
+    return {"ok": True}
+
 
 # Debug route 
 @app.get("/debug/page_count")

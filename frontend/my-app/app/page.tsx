@@ -130,6 +130,8 @@ export default function Home() {
   const [renamingFileId, setRenamingFileId] = useState<number | null>(null);
   const [renameValue, setRenameValue] = useState("");
 
+  // Action state - tracks which file row is in “action mode” to be able to remove
+  const [fileActionsOpenId, setFileActionsOpenId] = useState<number | null>(null);
 
     // ---------- load sidebar data (ONCE) ----------
   useEffect(() => {
@@ -506,24 +508,27 @@ export default function Home() {
       >
         {files.map(file => (
           <div
+            className="file-row"
             key={file.id}
-            style={{
-              padding: "8px",
-              cursor: "pointer",
-              background: file.id === activeFileId ? "#222" : "transparent",
-            }}
-            onDoubleClick={() => {
-              setRenamingFileId(file.id);
-              setRenameValue(file.title);
+            onDoubleClick={(e) => {
+              e.stopPropagation();
+              setFileActionsOpenId(prev =>
+                prev === file.id ? null : file.id
+              );
             }}
             onClick={() => {
               if (renamingFileId === file.id) return;
+              if (fileActionsOpenId === file.id) return; // 👈 don’t open file while in action mode
 
-              setRenamingFileId(null);
               setActiveFileId(file.id);
               setChatMode("document");
               setActiveAnnotationId(null);
               setContext(null);
+            }}
+            style={{
+              padding: "8px",
+              cursor: "pointer",
+              background: file.id === activeFileId ? "#222" : "transparent",
             }}
           >
             {renamingFileId === file.id ? (
@@ -552,8 +557,36 @@ export default function Home() {
                 }}
               />
             ) : (
-              file.title
-            )}
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                }}
+              >
+                <span>{file.title}</span>
+
+                {fileActionsOpenId === file.id && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      deleteFile(file.id);
+                      setFileActionsOpenId(null);
+                    }}
+                    style={{
+                      background: "transparent",
+                      border: "none",
+                      color: "#ff6b6b",
+                      cursor: "pointer",
+                      fontSize: "13px",
+                    }}
+                  >
+                    ✕
+                  </button>
+                )}
+              </div>
+            )
+}
           </div>
         ))}
 
@@ -622,7 +655,7 @@ export default function Home() {
                     renderAnnotationLayer={false}
                   />
 
-                  {/* ✅ Highlight overlay that resizes with the page */}
+                  {/* Highlight overlay that resizes with the page */}
                   <div
                     style={{
                       position: "absolute",

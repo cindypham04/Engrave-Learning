@@ -1,6 +1,7 @@
 # db.py
 import sqlite3
 import json
+import os
 
 DB_PATH = "data.db"
 
@@ -152,6 +153,7 @@ def init_annotations():
         geometry TEXT,
         text TEXT,
         region_id TEXT,
+        region_s3_key TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
@@ -379,6 +381,57 @@ def rename_file(file_id: int, new_title: str):
 
     return True
 
+def delete_file_cascade(file_id: int):
+    # Get the file info
+    cur = get_cursor()
+    cur.execute(
+        "SELECT pdf_path FROM files WHERE id = ?",
+        (file_id,)
+    )
+    row = cur.fetchone()
+    if not row:
+        raise Exception("File not found")
+
+    pdf_path = row[0]
+
+    # Get region annotations
+    cur.execute(
+        """
+        SELECT region_id
+        FROM annotations
+        WHERE file_id = ? AND type = 'region'
+        """,
+        (file_id,)
+    )
+    regions = cur.fetchall()
+
+    # Delete region images from disk
+    for (region_id,) in regions:
+        for ext in (".png", ".jpeg"):
+            path = os.path.join(REGION_DIR, f"{region_id}{ext}")
+            if os.path.exists(path):
+                os.remove(path)
+
+    # Delete annotations
+    cur.execute(
+        "DELETE FROM annotations WHERE file_id = ?",
+        (file_id,)
+    )
+
+    # Delete chats
+    cur.execute(
+        "DELETE FROM messages WHERE file_id = ?",
+        (file_id,)
+    )
+
+    # Delete file row
+    cur.execute(
+        "DELETE FROM files WHERE id = ?",
+        (file_id,)
+    )
+
+    if pdf_path and os.path.exists(pdf_path):
+        os.remove(pdf_path)
 
 
 # ======================================================
