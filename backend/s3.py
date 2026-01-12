@@ -55,6 +55,12 @@ def upload_region_to_s3(file_obj, user_id: int, region_id: str, content_type: st
 
     return key
 
+def delete_s3_object(s3_key: str):
+    s3.delete_object(
+        Bucket=BUCKET,
+        Key=s3_key,
+    )
+
 
 def generate_presigned_url(s3_key: str, expires_in: int = 3600) -> str:
     """

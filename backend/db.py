@@ -159,14 +159,14 @@ def init_annotations():
     """)
 
 
-def create_annotation(document_id, page_number, type, geometry, text=None, region_id=None):
+def create_annotation(document_id, page_number, type, geometry, text=None, region_id=None, region_s3_key=None,):
     cur = get_cursor()
     cur.execute(
         """
         INSERT INTO annotations (
-            document_id, page_number, type, geometry, text, region_id
+            document_id, page_number, type, geometry, text, region_id, region_s3_key
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
             document_id,
@@ -175,6 +175,7 @@ def create_annotation(document_id, page_number, type, geometry, text=None, regio
             json.dumps(geometry) if geometry else None,
             text,
             region_id,
+            region_s3_key,
         )
     )
     return cur.lastrowid
@@ -184,7 +185,7 @@ def get_annotation(annotation_id):
     cur = get_cursor()
     cur.execute(
         """
-        SELECT id, document_id, page_number, type, geometry, text, region_id
+        SELECT id, document_id, page_number, type, geometry, text, region_id, region_s3_key
         FROM annotations
         WHERE id = ?
         """,
@@ -202,6 +203,7 @@ def get_annotation(annotation_id):
         "geometry": json.loads(row[4]) if row[4] else None,
         "text": row[5],
         "region_id": row[6],
+        "region_s3_key": row[7],
     }
 
 
@@ -209,7 +211,7 @@ def get_annotations_by_document(document_id):
     cur = get_cursor()
     cur.execute(
         """
-        SELECT id, page_number, type, geometry, text, region_id, created_at
+        SELECT id, page_number, type, geometry, text, region_id, created_at, region_s3_key
         FROM annotations
         WHERE document_id = ?
         ORDER BY created_at ASC
@@ -225,6 +227,7 @@ def get_annotations_by_document(document_id):
             "text": r[4],
             "region_id": r[5],
             "created_at": r[6],
+            "region_s3_key": r[7],
         }
         for r in cur.fetchall()
     ]
@@ -382,56 +385,56 @@ def rename_file(file_id: int, new_title: str):
     return True
 
 def delete_file_cascade(file_id: int):
-    # Get the file info
     cur = get_cursor()
+
+    document_id = get_document_id_by_file(file_id)
+    if not document_id:
+        raise Exception("File not found")
+
+    # delete annotations
+    cur.execute("DELETE FROM annotations WHERE document_id = ?", (document_id,))
+
+    # delete messages
+    cur.execute("DELETE FROM messages WHERE document_id = ?", (document_id,))
+
+    # delete file row
+    cur.execute("DELETE FROM files WHERE id = ?", (file_id,))
+
+def delete_annotation(annotation_id: int):
+    cur = get_cursor()
+
+    # Get annotation (needed for region_s3_key)
     cur.execute(
-        "SELECT pdf_path FROM files WHERE id = ?",
-        (file_id,)
+        """
+        SELECT document_id, region_s3_key
+        FROM annotations
+        WHERE id = ?
+        """,
+        (annotation_id,)
     )
     row = cur.fetchone()
     if not row:
-        raise Exception("File not found")
+        return None
 
-    pdf_path = row[0]
+    document_id, region_s3_key = row
 
-    # Get region annotations
+    # Delete annotation messages
     cur.execute(
-        """
-        SELECT region_id
-        FROM annotations
-        WHERE file_id = ? AND type = 'region'
-        """,
-        (file_id,)
-    )
-    regions = cur.fetchall()
-
-    # Delete region images from disk
-    for (region_id,) in regions:
-        for ext in (".png", ".jpeg"):
-            path = os.path.join(REGION_DIR, f"{region_id}{ext}")
-            if os.path.exists(path):
-                os.remove(path)
-
-    # Delete annotations
-    cur.execute(
-        "DELETE FROM annotations WHERE file_id = ?",
-        (file_id,)
+        "DELETE FROM messages WHERE annotation_id = ?",
+        (annotation_id,)
     )
 
-    # Delete chats
+    # Delete annotation itself
     cur.execute(
-        "DELETE FROM messages WHERE file_id = ?",
-        (file_id,)
+        "DELETE FROM annotations WHERE id = ?",
+        (annotation_id,)
     )
 
-    # Delete file row
-    cur.execute(
-        "DELETE FROM files WHERE id = ?",
-        (file_id,)
-    )
+    return {
+        "document_id": document_id,
+        "region_s3_key": region_s3_key,
+    }
 
-    if pdf_path and os.path.exists(pdf_path):
-        os.remove(pdf_path)
 
 
 # ======================================================
@@ -445,9 +448,6 @@ init_users()
 init_folders()
 init_files()
 
-def begin():
-    cursor = get_cursor()
-    cursor.execute("BEGIN")
 
 def rollback():
     conn.rollback()

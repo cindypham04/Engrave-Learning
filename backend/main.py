@@ -18,24 +18,25 @@ from db import save_pages, get_pages, get_page_count
 from db import get_messages, save_message, get_annotation, get_messages_by_annotation, create_annotation, get_annotations_by_document
 from db import get_file, get_document_id_by_file
 from db import list_files, list_folders
-from s3 import upload_pdf, upload_region_to_s3
+from s3 import upload_pdf, upload_region_to_s3, delete_s3_object
 from s3 import generate_presigned_url
 from io import BytesIO
 from db import (
-    begin,
-    commit,
     rollback,
     create_file,
     update_file_s3_key,
     rename_file,
     commit,
     delete_file_cascade,
+    delete_annotation,
 )
 
 
+load_dotenv()  # Load OpenAI API key from .env file
 
-
-# load_dotenv()  # Load OpenAI API key from .env file
+import os
+print("AWS_ACCESS_KEY_ID:", os.getenv("AWS_ACCESS_KEY_ID"))
+print("AWS_S3_BUCKET:", os.getenv("AWS_S3_BUCKET"))
 
 # # Sanity check 
 # assert os.getenv("OPENAI_API_KEY") is not None, "OPENAI_API_KEY not found in environment variables."
@@ -53,11 +54,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 ) 
-
-
-# Define where region images will be stored
-REGION_DIR = "uploads/regions"
-os.makedirs(REGION_DIR, exist_ok=True) # create image directory if not exists
 
 
 def extract_pages_from_pdf_from_bytes(pdf_bytes: bytes, document_id: str):
@@ -276,25 +272,11 @@ def ask_openai(prompt_text, system_prompt=system_prompt):
     return response.output_text
 
 # Case 2: user asked about a region - call OpenAI 
-def ask_region(prompt_text, region_id, system_prompt=system_prompt):
-    png_path = os.path.join(REGION_DIR, f"{region_id}.png")
-    jpeg_path = os.path.join(REGION_DIR, f"{region_id}.jpeg")
+def ask_region(prompt_text: str, region_s3_key: str, system_prompt=system_prompt):
+    # 1. Generate temporary S3 URL
+    image_url = generate_presigned_url(region_s3_key)
 
-    if os.path.exists(png_path):
-        image_path = png_path
-        mime = "image/png"
-    elif os.path.exists(jpeg_path):
-        image_path = jpeg_path
-        mime = "image/jpeg"
-    else:
-        raise HTTPException(status_code=404, detail="Region image not found")
-
-    with open(image_path, "rb") as f:
-        img_bytes = f.read()
-
-    image_base64 = base64.b64encode(img_bytes).decode("utf-8")
-    data_url = f"data:{mime};base64,{image_base64}"
-
+    # 2. Send URL directly to OpenAI
     response = client.responses.create(
         model="gpt-4.1-mini",
         input=[
@@ -303,7 +285,10 @@ def ask_region(prompt_text, region_id, system_prompt=system_prompt):
                 "role": "user",
                 "content": [
                     {"type": "input_text", "text": prompt_text},
-                    {"type": "input_image", "image_url": data_url},
+                    {
+                        "type": "input_image",
+                        "image_url": image_url,
+                    },
                 ],
             },
         ],
@@ -335,15 +320,11 @@ class RenameFileRequest(BaseModel):
 async def upload_file(file: UploadFile = File(...)):
     document_id = str(uuid.uuid4())
     title = os.path.splitext(file.filename)[0]
-    user_id = 1  # temporary
+    user_id = 1
 
     pdf_bytes = await file.read()
 
     try:
-        # 1. Begin transaction
-        begin()
-
-        # 2. Create DB file row (no s3_key yet)
         file_id = create_file(
             folder_id=None,
             document_id=document_id,
@@ -351,17 +332,16 @@ async def upload_file(file: UploadFile = File(...)):
             user_id=user_id,
         )
 
-        # 3. Upload to S3
+        pages = extract_pages_from_pdf_from_bytes(pdf_bytes, document_id)
+        save_pages(pages)
+
         s3_key = upload_pdf(
             file_obj=BytesIO(pdf_bytes),
             user_id=user_id,
             file_id=file_id,
         )
 
-        # 4. Update s3_key
         update_file_s3_key(file_id, s3_key)
-
-        # 5. Commit transaction
         commit()
 
         return {
@@ -370,10 +350,9 @@ async def upload_file(file: UploadFile = File(...)):
         }
 
     except Exception as e:
-        # Rollback everything
         rollback()
+        print("UPLOAD ERROR:", e)  
         raise HTTPException(status_code=500, detail=str(e))
-
 
 
 @app.post("/annotations")
@@ -471,9 +450,9 @@ def upload_region_endpoint(
         file_obj=region.file,
         user_id=1,
         region_id=region_id,
+        content_type=region.content_type,
         ext=ext,
     )
-
 
 
     # Store geometry with annotation
@@ -491,7 +470,7 @@ def upload_region_endpoint(
         "region_id": region_id,
         "document_id": document_id,
         "page_number": page_number,
-        "url": f"http://localhost:8000/regions/{region_id}",
+        "region_s3_key": region_s3_key,
     }
 
 
@@ -566,9 +545,13 @@ Question:
 """
 
         if annotation["type"] == "region":
-            if not annotation.get("region_id"):
-                raise HTTPException(status_code=500, detail="Region annotation missing region_id")
-            answer = ask_region(prompt_text=prompt, region_id=annotation["region_id"])
+            if not annotation.get("region_s3_key"):
+                raise HTTPException(status_code=500, detail="Region missing S3 key")
+
+            answer = ask_region(
+                prompt_text=prompt,
+                region_s3_key=annotation["region_s3_key"],
+            )
         else:
             answer = ask_openai(prompt_text=prompt)
 
@@ -605,22 +588,6 @@ Question:
 
     return {"answer": answer}
 
-# Get region image from /regions
-@app.get("/regions/{region_id}")
-def get_region(region_id: str):
-    png_image = os.path.join(REGION_DIR, f"{region_id}.png")
-    jpeg_image = os.path.join(REGION_DIR, f"{region_id}.jpeg")
-    
-    if os.path.exists(png_image):
-        return FileResponse(path=png_image, media_type="image/png")
-
-    if os.path.exists(jpeg_image):
-        return FileResponse(path=jpeg_image, media_type="image/jpeg")
-    
-    raise HTTPException(
-        status_code=404,
-        detail=f"Region image {region_id} not found."
-    )
 
 @app.get("/chat/file/{file_id}")
 def get_chat(file_id: int):
@@ -678,7 +645,29 @@ def rename_file_endpoint(file_id: int, payload: RenameFileRequest):
 @app.delete("/files/{file_id}")
 def delete_file(file_id: int):
     delete_file_cascade(file_id)
+    commit()
     return {"ok": True}
+
+@app.delete("/annotations/{annotation_id}")
+def delete_annotation_endpoint(annotation_id: int):
+    try:
+
+        result = delete_annotation(annotation_id)
+        if not result:
+            rollback()
+            raise HTTPException(status_code=404, detail="Annotation not found")
+        
+        # If it's a region annotation, then delete the image from S3
+        if result["region_s3_key"]:
+            delete_s3_object(result["region_s3_key"])
+
+        commit()
+        return {"ok": True}
+    
+    except Exception as e:
+        rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 # Debug route 

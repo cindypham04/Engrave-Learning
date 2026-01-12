@@ -247,7 +247,23 @@ export default function Home() {
       body: formData,
     });
 
+    if (!res.ok) {
+      console.error("Upload failed");
+      return;
+    }
+
     const data = await res.json();
+
+    if (!data?.file_id) return;
+
+    setFiles(prev => {
+      if (prev.some(f => f.id === data.file_id)) return prev;
+
+      return [
+        { id: data.file_id, title: data.title, folder_id: null },
+        ...prev,
+      ];
+    });
 
     setActiveFileId(data.file_id);
     setContext(null);
@@ -309,6 +325,40 @@ export default function Home() {
     }
   }
 
+  /* ---------------- Delete-annotation handler ---------------- */
+  async function deleteAnnotation(annotationId: number) {
+    const ok = confirm("Delete this highlight and its conversation?");
+    if (!ok) return;
+
+    const res = await fetch(
+      `http://localhost:8000/annotations/${annotationId}`,
+      { method: "DELETE" }
+    );
+
+    if (!res.ok) {
+      alert("Failed to delete highlight");
+      return;
+    }
+
+    // Remove highlight from PDF
+    setHighlights(prev =>
+      prev.filter(h => h.annotation_id !== annotationId)
+    );
+
+    // Exit annotation mode
+    setActiveAnnotationId(null);
+    setContext(null);
+    setChatMode("document");
+
+    // Reload document-level chat
+    if (activeFileId) {
+      const res = await fetch(
+        `http://localhost:8000/chat/file/${activeFileId}`
+      );
+      const data = await res.json();
+      setMessages(data.messages || []);
+    }
+  }
 
 
   /* ---------------- Text selection ---------------- */
@@ -840,7 +890,30 @@ export default function Home() {
           flexDirection: "column",
         }}
       >
-        <h3>{activeFileTitle ?? "Conversation"}</h3>
+        <h3
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+          }}
+        >
+          <span>{activeFileTitle ?? "Conversation"}</span>
+
+          {activeAnnotationId && (
+            <button
+              onClick={() => deleteAnnotation(activeAnnotationId)}
+              style={{
+                background: "transparent",
+                border: "none",
+                color: "#ff6b6b",
+                cursor: "pointer",
+                fontSize: "0.85rem",
+              }}
+            >
+              Delete highlight
+            </button>
+          )}
+        </h3>
         {chatMode === "annotation" && (
           <button
             onClick={async () => {
@@ -874,20 +947,20 @@ export default function Home() {
         <div style={{ flex: 1, overflowY: "auto", marginBottom: "1rem" }}>
           {messages.map((m, i) => (
             <ChatMessage
-              key={i}
+              key={`${m.role}-${m.annotation_id ?? "doc"}-${i}`}
               role={m.role}
               content={m.content}
               onClick={
                 m.annotation_id
                   ? async () => {
-                      // 1️⃣ Activate annotation
+                      // Activate annotation
                       setActiveAnnotationId(m.annotation_id);
                       setChatMode("annotation");
 
-                      // 2️⃣ Fetch annotation metadata
+                      // Fetch annotation metadata
                       const annotation = await fetchAnnotation(m.annotation_id);
 
-                      // 3️⃣ Restore correct context
+                      // Restore correct context
                       if (annotation.type === "region") {
                         setContext({
                           type: "image",
@@ -902,10 +975,10 @@ export default function Home() {
                         });
                       }
 
-                      // 4️⃣ Load annotation-specific chat
+                      // Load annotation-specific chat
                       loadAnnotationChat(m.annotation_id);
 
-                      // 5️⃣ Scroll to the page
+                      // Scroll to the page
                       scrollToPage(annotation.page_number);
                     }
                   : undefined
