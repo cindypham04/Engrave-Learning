@@ -2,6 +2,7 @@
 import sqlite3
 import json
 import os
+from typing import Optional
 
 DB_PATH = "data.db"
 
@@ -259,8 +260,10 @@ def init_folders():
     CREATE TABLE IF NOT EXISTS folders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
+        parent_id INTEGER,
         user_id INTEGER NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (parent_id) REFERENCES folders(id)
     )
     """)
 
@@ -281,27 +284,49 @@ def init_files():
     """)
 
 
-def create_folder(name: str, user_id: int):
+def create_folder(name: str, user_id: int, parent_id: Optional[int] = None):
     cur = get_cursor()
     cur.execute(
-        "INSERT INTO folders (name, user_id) VALUES (?, ?)",
-        (name, user_id)
+        """
+        INSERT INTO folders (name, user_id, parent_id)
+        VALUES (?, ?, ?)
+        """,
+        (name, user_id, parent_id)
     )
     return cur.lastrowid
 
 
-def list_folders(user_id=1):
+def list_folders(user_id: int, parent_id: Optional[int] = None):
     cur = get_cursor()
-    cur.execute(
-        """
-        SELECT id, name, created_at
-        FROM folders
-        WHERE user_id = ?
-        ORDER BY created_at ASC
-        """,
-        (user_id,)
-    )
-    return [{"id": r[0], "name": r[1], "created_at": r[2]} for r in cur.fetchall()]
+
+    if parent_id is None:
+        cur.execute(
+            """
+            SELECT id, name, parent_id
+            FROM folders
+            WHERE user_id = ? AND parent_id IS NULL
+            ORDER BY created_at ASC
+            """,
+            (user_id,)
+        )
+    else:
+        cur.execute(
+            """
+            SELECT id, name, parent_id
+            FROM folders
+            WHERE user_id = ? AND parent_id = ?
+            ORDER BY created_at ASC
+            """,
+            (user_id, parent_id)
+        )
+
+    return {
+        "folders": [
+            {"id": r[0], "name": r[1], "parent_id": r[2]}
+            for r in cur.fetchall()
+        ]
+    }
+
 
 
 def create_file(folder_id, document_id, title, user_id):
@@ -384,6 +409,23 @@ def rename_file(file_id: int, new_title: str):
 
     return True
 
+def rename_folder(folder_id: int, new_name: str):
+    cur = get_cursor()
+    cur.execute(
+        """
+        UPDATE folders
+        SET name = ?
+        WHERE id = ?
+        """,
+        (new_name, folder_id),
+    )
+
+    if cur.rowcount == 0:
+        return False
+
+    return True
+
+
 def delete_file_cascade(file_id: int):
     cur = get_cursor()
 
@@ -434,6 +476,13 @@ def delete_annotation(annotation_id: int):
         "document_id": document_id,
         "region_s3_key": region_s3_key,
     }
+
+def set_folder_parent(folder_id: int, parent_id: Optional[int]):
+    cur = get_cursor()
+    cur.execute(
+        "UPDATE folders SET parent_id = ? WHERE id = ?",
+        (parent_id, folder_id)
+    )
 
 
 

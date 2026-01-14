@@ -5,6 +5,8 @@ import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import "katex/dist/katex.min.css";
 
+const UI_RADIUS = 12;
+
 export type ChatMessageProps = {
   role: "user" | "assistant";
   content: string;
@@ -22,15 +24,15 @@ export default function ChatMessage({
     <div
       onClick={onClick}
       style={{
-        marginBottom: "0.75rem",
-        padding: "8px 10px",
-        borderRadius: "8px",
-        background: isUser ? "#e5f0ff" : "#f3f4f6",
-        color: "#000",
+        marginBottom: "1rem",
+        padding: isUser ? "8px 10px" : "0",
+        borderRadius: UI_RADIUS,
+        background: isUser ? "#e5f0ff" : "transparent",
+        color: "var(--text-main)",
         cursor: onClick ? "pointer" : "default",
-        fontSize: "14px",
-        lineHeight: "1.4",
-      }}
+        fontSize: "16px",   
+        lineHeight: "1.6",     
+        }}
     >
       <ReactMarkdown
         remarkPlugins={[remarkMath]}

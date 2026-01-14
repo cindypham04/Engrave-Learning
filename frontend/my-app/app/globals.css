@@ -3,8 +3,13 @@
 @tailwind utilities;
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  /* App theme */
+  --bg-main: #F9F9FB;
+  --bg-input: #F9F9FB;
+  --bg-button: #E3DAC9;
+
+  --text-main: #000000;
+  --border-light: #F9F9FB;
 }
 
 /* Prevent KaTeX from duplicating symbols on copy-paste */
@@ -12,17 +17,46 @@
   display: none;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
+/* Global base styles */
+html,
 body {
-  background: var(--background);
-  color: var(--foreground);
+  background-color: var(--bg-main);
+  color: var(--text-main);
   font-family: Calibri, "Segoe UI", Candara, Arial, sans-serif;
   font-size: 16px;
   line-height: 25px;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden; /* prevent page scroll */
+}
+
+#__next {
+  height: 100%;
+}
+
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 2px;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  background: #000;
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+input[type="range"]::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  background: #000;
+  border-radius: 50%;
 }

@@ -99,6 +99,10 @@ export default function Home() {
 
   const pageRefs = useRef<Record<number, HTMLDivElement | null>>({});
 
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const isClickingPopupRef = useRef(false);
+
   // Stored highlights
   const [highlights, setHighlights] = useState<Highlight[]>([]);
 
@@ -130,18 +134,64 @@ export default function Home() {
   const [renamingFileId, setRenamingFileId] = useState<number | null>(null);
   const [renameValue, setRenameValue] = useState("");
 
-  // Action state - tracks which file row is in “action mode” to be able to remove
+  // Action state - tracks which file or folder row is in “action mode” to be able to remove
   const [fileActionsOpenId, setFileActionsOpenId] = useState<number | null>(null);
+  const [folderActionsOpenId, setFolderActionsOpenId] = useState<number | null>(null);
 
-    // ---------- load sidebar data (ONCE) ----------
+  // Navigation state - allows creating new folders or upload new files
+  const [currentFolderId, setCurrentFolderId] = useState<number | null>(null);
+  const [folderStack, setFolderStack] = useState<number[]>([]);
+
+  // "Add menu" state
+  const [addMenuOpen, setAddMenuOpen] = useState(false);
+
+  // Current folder name on "Heading" of sidebar state
+  const [currentFolderName, setCurrentFolderName] = useState<string | null>(null);
+
+  // Rename and Delete folder state
+  const [renamingFolderId, setRenamingFolderId] = useState<number | null>(null);
+  const [renameFolderValue, setRenameFolderValue] = useState("");
+
+  // Adjust sidebar width state
+  const [sidebarWidth, setSidebarWidth] = useState(240);
+  const [isResizingSidebar, setIsResizingSidebar] = useState(false);
+
+  const PDF_INSET = 0.95;
+
+  const folderHoldTimeoutRef = useRef<number | null>(null);
+  const didTriggerHoldRef = useRef(false);
+
+  // Diviver of panels
+  const DIVIDER_COLOR = "#000";
+  const DIVIDER_WIDTH = "1px";
+
+  // Corners of the chat box
+  const UI_RADIUS = 12;
+
+
+  const pdfContentRef = useRef<HTMLDivElement | null>(null);
+  const [pdfContentWidth, setPdfContentWidth] = useState(0);
+
+
+  // ---------- load folders (depends on current folder) ----------
   useEffect(() => {
-    fetch("http://localhost:8000/folders")
+    const url =
+      currentFolderId === null
+        ? "http://localhost:8000/folders"
+        : `http://localhost:8000/folders?parent_id=${currentFolderId}`;
+
+    fetch(url)
       .then(res => res.json())
       .then(data => setFolders(data.folders));
+  }, [currentFolderId]);
 
+  // ---------- load files (ONCE) ----------
+  useEffect(() => {
     fetch("http://localhost:8000/files")
       .then(res => res.json())
-      .then(data => setFiles(Array.isArray(data) ? data : data.files ?? []));
+      .then(data =>
+        setFiles(Array.isArray(data) ? data : data.files ?? [])
+      );
   }, []);
 
   // ---------- load file state ----------
@@ -175,7 +225,71 @@ export default function Home() {
     };
   }, [isResizing]);
 
-  
+  useEffect(() => {
+    function handleClick(e: MouseEvent) {
+      const target = e.target as HTMLElement;
+
+      // Don't close menus when clicking inside sidebar items
+      if (target.closest(".file-row") || target.closest("[data-folder-row]")) {
+        return;
+      }
+
+      setFileActionsOpenId(null);
+      setFolderActionsOpenId(null);
+    }
+
+
+    window.addEventListener("click", handleClick);
+    return () => window.removeEventListener("click", handleClick);
+  }, []);
+
+  // Mouse listener
+  useEffect(() => {
+    function handleMouseMove(e: MouseEvent) {
+      if (!isResizingSidebar) return;
+
+      const newWidth = e.clientX;
+
+      // Clamp so it stays usable
+      const clamped = Math.min(400, Math.max(160, newWidth));
+      setSidebarWidth(clamped);
+    }
+
+    function handleMouseUp() {
+      setIsResizingSidebar(false);
+    }
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, [isResizingSidebar]);
+
+  // Adjusting pdf width to be the same as range
+  useEffect(() => {
+    if (!pdfContentRef.current) return;
+
+    const el = pdfContentRef.current;
+
+    const observer = new ResizeObserver(entries => {
+      const entry = entries[0];
+      if (!entry) return;
+
+      setPdfContentWidth(entry.contentRect.width);
+    });
+
+    requestAnimationFrame(() => {
+      observer.observe(el);
+    });
+
+    return () => observer.disconnect();
+  }, []);
+
+
+
 
   /* ---------------- Helpers ---------------- */
 
@@ -205,11 +319,12 @@ export default function Home() {
     );
 
     if (!res.ok) {
-      throw new Error("Failed to fetch annotation");
+      return null;
     }
 
     return res.json();
   }
+
 
   async function loadFileState(fileId: number) {
     const res = await fetch(`http://localhost:8000/files/${fileId}/state`);
@@ -232,15 +347,17 @@ export default function Home() {
     setHighlights(restoredHighlights);
   }
 
-
-
   /* ---------------- Upload PDF ---------------- */
 
   async function handleUpload(event: React.ChangeEvent<HTMLInputElement>) {
     if (!event.target.files?.[0]) return;
 
     const formData = new FormData();
-    formData.append("file", event.target.files[0]);
+      formData.append("file", event.target.files[0]);
+
+      if (currentFolderId !== null) {
+        formData.append("folder_id", String(currentFolderId));
+      }
 
     const res = await fetch("http://localhost:8000/upload", {
       method: "POST",
@@ -256,14 +373,15 @@ export default function Home() {
 
     if (!data?.file_id) return;
 
-    setFiles(prev => {
-      if (prev.some(f => f.id === data.file_id)) return prev;
+    setFiles(prev => [
+      {
+        id: data.file_id,
+        title: data.title,
+        folder_id: currentFolderId,
+      },
+      ...prev,
+    ]);
 
-      return [
-        { id: data.file_id, title: data.title, folder_id: null },
-        ...prev,
-      ];
-    });
 
     setActiveFileId(data.file_id);
     setContext(null);
@@ -271,6 +389,95 @@ export default function Home() {
     setQuestion("");
 
   }
+
+  // Folder Icon 
+  function FolderIcon({ size = 16 }: { size?: number }) {
+    return (
+      <svg
+        width={size}
+        height={size}
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        style={{ marginRight: 6 }}
+      >
+        <path d="M3 7h5l2 2h11v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
+      </svg>
+    );
+  }
+
+  // File Icon
+  function FileIcon({ size = 14 }: { size?: number }) {
+    return (
+      <svg
+        width={size}
+        height={size}
+        viewBox="0 0 16 16"
+        xmlns="http://www.w3.org/2000/svg"
+        style={{ marginRight: 6, opacity: 0.7 }}
+      >
+        <line x1="3" y1="5" x2="13" y2="5" stroke="currentColor" strokeWidth="1" />
+        <line x1="3" y1="8" x2="13" y2="8" stroke="currentColor" strokeWidth="1" />
+        <line x1="3" y1="11" x2="10" y2="11" stroke="currentColor" strokeWidth="1" />
+      </svg>
+    );
+  }
+
+
+  /* ---------------- Delete Folder ---------------- */
+  async function deleteFolder(folderId: number) {
+    const ok = confirm("Delete this folder and all its contents?");
+    if (!ok) return;
+
+    await fetch(`http://localhost:8000/folders/${folderId}`, {
+      method: "DELETE",
+    });
+
+    setFolders(prev => prev.filter(f => f.id !== folderId));
+  }
+
+  async function activateAnnotation(annotationId: number) {
+    // Activate annotation
+    setActiveAnnotationId(annotationId);
+    setChatMode("annotation");
+
+    // Fetch annotation metadata
+    const annotation = await fetchAnnotation(annotationId);
+
+    if (!annotation) {
+      // Annotation no longer exists — recover gracefully
+      setActiveAnnotationId(null);
+      setContext(null);
+      setChatMode("document");
+      return;
+    }
+
+
+    // Restore context
+    if (annotation.type === "region") {
+      setContext({
+        type: "image",
+        region_id: annotation.region_id,
+        page_number: annotation.page_number,
+      });
+    } else {
+      setContext({
+        type: "text",
+        page: annotation.page_number,
+        text: annotation.text ?? "",
+      });
+    }
+
+    // Load annotation-specific chat
+    await loadAnnotationChat(annotationId);
+
+    // Scroll to page
+    scrollToPage(annotation.page_number);
+  }
+
 
   /* ---------------- Rename PDF File ---------------- */
   async function renameFile(fileId: number, newTitle: string) {
@@ -325,6 +532,51 @@ export default function Home() {
     }
   }
 
+  /* ---------------- Create Folder ---------------- */
+  async function createFolder() {
+    const name = prompt("Folder name");
+    if (!name) return;
+
+    const res = await fetch("http://localhost:8000/folders", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name,
+        parent_id: currentFolderId,
+      }),
+    });
+
+    if (!res.ok) {
+      alert("Failed to create folder");
+      return;
+    }
+
+    const folder = await res.json();
+    setFolders(prev => [...prev, folder]);
+  }
+
+  /* ---------------- Rename Folder ---------------- */
+  async function renameFolder(folderId: number, newName: string) {
+    if (!newName.trim()) return;
+
+    await fetch(`http://localhost:8000/folders/${folderId}/rename`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: newName }),
+    });
+
+    setFolders(prev =>
+      prev.map(f =>
+        f.id === folderId ? { ...f, name: newName } : f
+      )
+    );
+
+    if (currentFolderId === folderId) {
+      setCurrentFolderName(newName);
+    }
+  }
+
+
   /* ---------------- Delete-annotation handler ---------------- */
   async function deleteAnnotation(annotationId: number) {
     const ok = confirm("Delete this highlight and its conversation?");
@@ -360,6 +612,22 @@ export default function Home() {
     }
   }
 
+  const visibleFolders = folders.filter(f =>
+    currentFolderId === null
+      ? f.parent_id === null
+      : f.parent_id === currentFolderId
+  );
+
+  const visibleFiles = files.filter(f =>
+    currentFolderId === null
+      ? f.folder_id === null
+      : f.folder_id === currentFolderId
+  );
+
+  const currentFolder = currentFolderId
+    ? folders.find(f => f.id === currentFolderId)
+    : null;
+
 
   /* ---------------- Text selection ---------------- */
 
@@ -367,6 +635,8 @@ export default function Home() {
     if (regionMode) return;
 
     function handleSelectionChange() {
+      if (isClickingPopupRef.current) return;
+
       const sel = window.getSelection();
       if (!sel || sel.isCollapsed) {
         hidePopup();
@@ -547,124 +817,444 @@ export default function Home() {
 
   /* ---------------- UI ---------------- */
   return (
-    <div style={{ display: "flex", height: "100vh" }}>
+    <div
+      style={{
+        display: "flex",
+        height: "100vh",
+        overflow: "hidden", // ← critical
+      }}
+    >
       {/* Sidebar */}
       <div
         style={{
-          width: sidebarOpen ? 240 : 0,
-          overflow: "hidden",
+          width: sidebarOpen ? sidebarWidth : 0,
+          height: "100%",
+          overflowY: "auto",
+          overflowX: "hidden",
           transition: "width 0.2s ease",
+          borderRight: sidebarOpen ? `${DIVIDER_WIDTH} solid ${DIVIDER_COLOR}` : "none",
         }}
       >
-        {files.map(file => (
-          <div
-            className="file-row"
-            key={file.id}
-            onDoubleClick={(e) => {
-              e.stopPropagation();
-              setFileActionsOpenId(prev =>
-                prev === file.id ? null : file.id
-              );
-            }}
-            onClick={() => {
-              if (renamingFileId === file.id) return;
-              if (fileActionsOpenId === file.id) return; // 👈 don’t open file while in action mode
+        
+          {/* Hidden file input */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="application/pdf"
+            style={{ display: "none" }}
+            onChange={handleUpload}
+          />
 
-              setActiveFileId(file.id);
-              setChatMode("document");
-              setActiveAnnotationId(null);
-              setContext(null);
-            }}
-            style={{
-              padding: "8px",
-              cursor: "pointer",
-              background: file.id === activeFileId ? "#222" : "transparent",
-            }}
-          >
-            {renamingFileId === file.id ? (
-              <input
-                autoFocus
-                value={renameValue}
-                onChange={e => setRenameValue(e.target.value)}
-                onBlur={async () => {
-                  await renameFile(file.id, renameValue);
-                  setRenamingFileId(null);
-                }}
-                onKeyDown={async e => {
-                  if (e.key === "Enter") {
-                    await renameFile(file.id, renameValue);
-                    setRenamingFileId(null);
+        {/* Sidebar header */}
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            padding: "8px",
+            borderBottom: "1px solid #333",
+            fontWeight: 600,
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+            {currentFolderId !== null && (
+              <span
+                style={{ cursor: "pointer" }}
+                onClick={() => {
+                  const prevId = folderStack.at(-1) ?? null;
+                  setCurrentFolderId(prevId);
+                  setFolderStack(prev => prev.slice(0, -1));
+
+                  if (prevId === null) {
+                    setCurrentFolderName(null); // back to Home
+                  } else {
+                    const prevFolder = folders.find(f => f.id === prevId);
+                    setCurrentFolderName(prevFolder?.name ?? null);
                   }
-                  if (e.key === "Escape") {
-                    setRenamingFileId(null);
-                  }
-                }}
-                style={{
-                  width: "100%",
-                  background: "#111",
-                  color: "#fff",
-                  border: "1px solid #555",
-                }}
-              />
-            ) : (
-              <div
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "center",
                 }}
               >
-                <span>{file.title}</span>
+                ←
+              </span>
+            )}
 
-                {fileActionsOpenId === file.id && (
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      deleteFile(file.id);
-                      setFileActionsOpenId(null);
-                    }}
-                    style={{
-                      background: "transparent",
-                      border: "none",
-                      color: "#ff6b6b",
-                      cursor: "pointer",
-                      fontSize: "13px",
-                    }}
-                  >
-                    ✕
-                  </button>
-                )}
-              </div>
-            )
-}
+            <span>{currentFolderName ?? "Home"}</span>
           </div>
-        ))}
+
+          <span
+            style={{ cursor: "pointer" }}
+            onClick={() => setAddMenuOpen(v => !v)}
+          >
+            +
+          </span>
+        </div>
+
+        {addMenuOpen && (
+          <div
+            style={{
+              padding: "6px",
+              borderBottom: "1px solid #c7dcff",
+              background: "#e6f0ff",
+              borderRadius: "6px",
+              margin: "6px",
+            }}
+          >
+
+            <div
+              style={{ padding: "6px", cursor: "pointer" }}
+              onClick={() => {
+                setAddMenuOpen(false);
+                fileInputRef.current?.click();
+              }}
+            >
+              <FileIcon />
+              <span>PDF</span>
+            </div>
+
+            <div
+              style={{ padding: "6px", cursor: "pointer" }}
+              onClick={() => {
+                setAddMenuOpen(false);
+                createFolder();
+              }}
+            >
+              <FolderIcon />
+              <span>Folder</span>
+            </div>
+          </div>
+        )}
+
+        {/* Folders */}
+          {visibleFolders.map(folder => (
+            <div
+              key={folder.id}
+              data-folder-row
+              style={{
+                position: "relative",
+                padding: "8px",
+                cursor: "pointer",
+                fontWeight: 500,
+                color: "#000",
+                userSelect: "none",
+              }}
+              onMouseDown={() => {
+                // If menu already open, do nothing
+                if (folderActionsOpenId === folder.id) return;
+
+                didTriggerHoldRef.current = false;
+
+                folderHoldTimeoutRef.current = window.setTimeout(() => {
+                  didTriggerHoldRef.current = true;
+                  setFolderActionsOpenId(folder.id);
+                }, 2000); // ⏱ 2 seconds
+              }}
+              onMouseUp={() => {
+                // Cancel hold timer
+                if (folderHoldTimeoutRef.current) {
+                  clearTimeout(folderHoldTimeoutRef.current);
+                  folderHoldTimeoutRef.current = null;
+                }
+
+                // If long-press triggered → do NOT open folder
+                if (didTriggerHoldRef.current) return;
+
+                // Normal click → open folder
+                if (renamingFolderId === folder.id) return;
+                if (folderActionsOpenId === folder.id) return;
+
+                setFolderStack(prev =>
+                  currentFolderId !== null ? [...prev, currentFolderId] : prev
+                );
+                setCurrentFolderId(folder.id);
+                setCurrentFolderName(folder.name);
+              }}
+              onMouseLeave={() => {
+                if (folderHoldTimeoutRef.current) {
+                  clearTimeout(folderHoldTimeoutRef.current);
+                  folderHoldTimeoutRef.current = null;
+                }
+              }}
+            >
+              {renamingFolderId === folder.id ? (
+                <input
+                  autoFocus
+                  value={renameFolderValue}
+                  onChange={e => setRenameFolderValue(e.target.value)}
+                  onBlur={async () => {
+                    await renameFolder(folder.id, renameFolderValue);
+                    setRenamingFolderId(null);
+                  }}
+                  onKeyDown={async e => {
+                    if (e.key === "Enter") {
+                      await renameFolder(folder.id, renameFolderValue);
+                      setRenamingFolderId(null);
+                    }
+                    if (e.key === "Escape") {
+                      setRenamingFolderId(null);
+                    }
+                  }}
+                />
+              ) : (
+                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  <span style={{ display: "flex", alignItems: "center" }}>
+                    <FolderIcon />
+                    {folder.name}
+                  </span>
+
+                  {folderActionsOpenId === folder.id && (
+                    <div
+                      onClick={e => e.stopPropagation()}
+                      style={{
+                        position: "absolute",
+                        right: "8px",
+                        top: "50%",
+                        transform: "translateY(-50%)",
+                        display: "flex",
+                        alignItems: "center",
+                        background: "#fff",
+                        borderRadius: "8px",
+                        padding: "6px 8px",
+                        boxShadow: "0 4px 12px rgba(0,0,0,0.08)",
+                        fontSize: "0.85rem",
+                        zIndex: 50,
+                      }}
+                    >
+                      {/* Rename */}
+                      <span
+                        style={{
+                          padding: "2px 6px",
+                          cursor: "pointer",
+                          borderRadius: "4px",
+                        }}
+                        onClick={() => {
+                          setRenamingFolderId(folder.id);
+                          setRenameValue(folder.title);
+                          setFolderActionsOpenId(null);
+                        }}
+                        onMouseEnter={e =>
+                          (e.currentTarget.style.background = "#f5f5f5")
+                        }
+                        onMouseLeave={e =>
+                          (e.currentTarget.style.background = "transparent")
+                        }
+                      >
+                        Rename
+                      </span>
+
+                      {/* Divider */}
+                      <div
+                        style={{
+                          width: "1px",
+                          height: "90%",
+                          background: "#ddd",
+                          margin: "0 6px",
+                        }}
+                      />
+
+                      {/* Delete */}
+                      <span
+                        style={{
+                          padding: "2px 6px",
+                          cursor: "pointer",
+                          color: "#e53935",
+                          borderRadius: "4px",
+                        }}
+                        onClick={() => {
+                          deleteFolder(folder.id);
+                          setFolderActionsOpenId(null);
+                        }}
+                        onMouseEnter={e =>
+                          (e.currentTarget.style.background = "#fdecea")
+                        }
+                        onMouseLeave={e =>
+                          (e.currentTarget.style.background = "transparent")
+                        }
+                      >
+                        Delete
+                      </span>
+                    </div>
+                  )}
+
+                </div>
+              )}
+            </div>
+          ))}
+
+
+          {/* Files */}
+          {visibleFiles.map(file => (
+            <div
+              className="file-row"
+              key={file.id}
+              onDoubleClick={(e) => {
+                e.stopPropagation();
+                setFileActionsOpenId(prev =>
+                  prev === file.id ? null : file.id
+                );
+              }}
+              onClick={() => {
+                if (renamingFileId === file.id) return;
+                if (fileActionsOpenId === file.id) return;
+
+                setActiveFileId(file.id);
+                setChatMode("document");
+                setActiveAnnotationId(null);
+                setContext(null);
+              }}
+              style={{
+                position: "relative",
+                padding: "8px",
+                cursor: "pointer",
+                background: file.id === activeFileId ? "#e5f0ff" : "transparent",
+              }}
+            >
+              {renamingFileId === file.id ? (
+                <input
+                  autoFocus
+                  value={renameValue}
+                  onChange={e => setRenameValue(e.target.value)}
+                  onBlur={async () => {
+                    await renameFile(file.id, renameValue);
+                    setRenamingFileId(null);
+                  }}
+                  onKeyDown={async e => {
+                    if (e.key === "Enter") {
+                      await renameFile(file.id, renameValue);
+                      setRenamingFileId(null);
+                    }
+                    if (e.key === "Escape") {
+                      setRenamingFileId(null);
+                    }
+                  }}
+                />
+              ) : (
+                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  <span style={{ display: "flex", alignItems: "center" }}>
+                    <FileIcon />
+                    {file.title}
+                  </span>
+
+
+                  {fileActionsOpenId === file.id && (
+                    <div
+                      onClick={e => e.stopPropagation()}
+                      style={{
+                        position: "absolute",
+                        right: "8px",
+                        top: "50%",
+                        transform: "translateY(-50%)",
+                        display: "flex",
+                        alignItems: "center",
+                        background: "#fff",
+                        borderRadius: "8px",
+                        padding: "6px 8px",
+                        boxShadow: "0 4px 12px rgba(0,0,0,0.08)",
+                        fontSize: "0.85rem",
+                        zIndex: 50,
+                      }}
+                    >
+                      {/* Rename */}
+                      <span
+                        style={{
+                          padding: "2px 6px",
+                          cursor: "pointer",
+                          borderRadius: "4px",
+                        }}
+                        onClick={() => {
+                          setRenamingFileId(file.id);
+                          setRenameValue(file.title);
+                          setFileActionsOpenId(null);
+                        }}
+                        onMouseEnter={e =>
+                          (e.currentTarget.style.background = "#f5f5f5")
+                        }
+                        onMouseLeave={e =>
+                          (e.currentTarget.style.background = "transparent")
+                        }
+                      >
+                        Rename
+                      </span>
+
+                      {/* Divider */}
+                      <div
+                        style={{
+                          width: "1px",
+                          height: "90%",
+                          background: "#ddd",
+                          margin: "0 6px",
+                        }}
+                      />
+
+                      {/* Delete */}
+                      <span
+                        style={{
+                          padding: "2px 6px",
+                          cursor: "pointer",
+                          color: "#e53935",
+                          borderRadius: "4px",
+                        }}
+                        onClick={() => {
+                          deleteFile(file.id);
+                          setFileActionsOpenId(null);
+                        }}
+                        onMouseEnter={e =>
+                          (e.currentTarget.style.background = "#fdecea")
+                        }
+                        onMouseLeave={e =>
+                          (e.currentTarget.style.background = "transparent")
+                        }
+                      >
+                        Delete
+                      </span>
+                    </div>
+                  )}
+
+                </div>
+              )}
+            </div>
+          ))}
 
         </div>
 
+      {sidebarOpen && (
+        <div
+          onMouseDown={() => setIsResizingSidebar(true)}
+          style={{
+            width: DIVIDER_WIDTH,
+            cursor: "col-resize",
+            background: DIVIDER_COLOR,
+            userSelect: "none",
+          }}
+        />
+      )}
 
       {/* PDF Viewer */}
       <div
         style={{
           width: `${100 - chatWidth}%`,
+          height: "100%",       
           padding: "1rem",
-          overflow: "auto",
+          overflow: "auto",      // scroll inside panel only
+          minHeight: 0,       
         }}
       >
-        <input type="file" accept="application/pdf" onChange={handleUpload} />
         <button
           onClick={() => setSidebarOpen(v => !v)}
           style={{
             marginBottom: "0.5rem",
-            fontSize: "0.85rem",
+            fontSize: "1.2rem",
+            background: "transparent",
+            border: "none",
+            padding: 0,
+            cursor: "pointer",
           }}
         >
-          {sidebarOpen ? "Hide files" : "Show files"}
+          {sidebarOpen ? "<<" : ">>"}
         </button>
-        <div style={{ marginBottom: "0.5rem" }}>
-          <label style={{ fontSize: "0.85rem" }}>
-            Zoom: {Math.round(pdfScale * 100)}%
-          </label>
+
+        <div
+          ref={pdfContentRef}
+          style={{ width: "100%" }}
+        >
           <input
             type="range"
             min={0.6}
@@ -672,9 +1262,21 @@ export default function Home() {
             step={0.05}
             value={pdfScale}
             onChange={(e) => setPdfScale(Number(e.target.value))}
-            style={{ width: "100%" }}
+            style={{
+              width: "100%",
+              marginBottom: "0.75rem",
+              background: `linear-gradient(
+                to right,
+                #000 0%,
+                #000 ${((pdfScale - 0.6) / (2 - 0.6)) * 100}%,
+                #ccc ${((pdfScale - 0.6) / (2 - 0.6)) * 100}%,
+                #ccc 100%
+              )`,
+            }}
           />
         </div>
+
+
 
         {pdfUrl && (
           <Document file={pdfUrl} onLoadSuccess={({ numPages }) => setNumPages(numPages)}>
@@ -698,14 +1300,16 @@ export default function Home() {
                     display: "inline-block", 
                   }}
                 >
-                  <Page
-                    pageNumber={pageNumber}
-                    scale={pdfScale}
-                    renderTextLayer
-                    renderAnnotationLayer={false}
-                  />
+                  {pdfContentWidth > 0 && (
+                    <Page
+                      pageNumber={pageNumber}
+                      width={pdfContentWidth * PDF_INSET * pdfScale}
+                      renderTextLayer
+                      renderAnnotationLayer={false}
+                    />
+                  )}
 
-                  {/* Highlight overlay that resizes with the page */}
+                 {/* Visual highlight */}
                   <div
                     style={{
                       position: "absolute",
@@ -714,27 +1318,54 @@ export default function Home() {
                       zIndex: 5,
                     }}
                   >
-                    {pageHighlights.map(h => {
-                      const isActive = h.annotation_id === activeAnnotationId;
-
-                      return (
-                        <div
-                          key={h.annotation_id}
-                          style={{
-                            position: "absolute",
-                            left: `${h.rect.x * 100}%`,
-                            top: `${h.rect.y * 100}%`,
-                            width: `${h.rect.width * 100}%`,
-                            height: `${h.rect.height * 100}%`,
-                            background: isActive
-                              ? "rgba(0,112,243,0.15)"
+                    {pageHighlights.map(h => (
+                      <div
+                        key={`visual-${h.annotation_id}`}
+                        style={{
+                          position: "absolute",
+                          left: `${h.rect.x * 100}%`,
+                          top: `${h.rect.y * 100}%`,
+                          width: `${h.rect.width * 100}%`,
+                          height: `${h.rect.height * 100}%`,
+                          background:
+                            h.annotation_id === activeAnnotationId
+                              ? "rgba(0,112,243,0.08)"
                               : "rgba(255, 235, 59, 0.18)",
-                            borderRadius: "2px",
-                          }}
-                        />
-                      );
-                    })}
+                          borderRadius: "10px",
+                        }}
+                      />
+                    ))}
                   </div>
+
+                  {/* Click hitboxes */}
+                  <div
+                    style={{
+                      position: "absolute",
+                      inset: 0,
+                      pointerEvents: "none",
+                      zIndex: 20, // 👈 higher than everything else
+                    }}
+                  >
+                    {pageHighlights.map(h => (
+                      <div
+                        key={`hit-${h.annotation_id}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          activateAnnotation(h.annotation_id);
+                        }}
+                        style={{
+                          position: "absolute",
+                          left: `${h.rect.x * 100}%`,
+                          top: `${h.rect.y * 100}%`,
+                          width: `${h.rect.width * 100}%`,
+                          height: `${h.rect.height * 100}%`,
+                          pointerEvents: "auto",
+                          cursor: "pointer",
+                        }}
+                      />
+                    ))}
+                  </div>
+
 
                   {regionMode && activePage === pageNumber && (
                     <div
@@ -796,63 +1427,64 @@ export default function Home() {
 
         {!regionMode && (
           <div
-            ref={popupRef}
-            onMouseDown={async () => {
-              if (!pendingTextRef.current || !activeFileId) return;
+              ref={popupRef}
+              onMouseDown={async (e) => {
+                e.preventDefault(); // 👈 critical
+                isClickingPopupRef.current = true;
 
-              // Type narrow ONCE, explicitly
-              const ctx = pendingTextRef.current;
-              if (ctx.type !== "text") return;
+                if (!pendingTextRef.current || !activeFileId) return;
+                const ctx = pendingTextRef.current;
+                if (ctx.type !== "text") return;
 
-              const rect = pendingTextRectRef.current;
-              const pageEl = pageRefs.current[ctx.page];
+                const rect = pendingTextRectRef.current;
+                const pageEl = pageRefs.current[ctx.page];
+                if (!rect || !pageEl) return;
 
-              if (!rect || !pageEl) return;
+                const pageRect = pageEl.getBoundingClientRect();
 
-              const pageRect = pageEl.getBoundingClientRect();
+                const geometry = {
+                  x: (rect.left - pageRect.left) / pageRect.width,
+                  y: (rect.top - pageRect.top) / pageRect.height,
+                  width: rect.width / pageRect.width,
+                  height: rect.height / pageRect.height,
+                };
 
-              // Normalized geometry (page-relative)
-              const geometry = {
-                x: (rect.left - pageRect.left) / pageRect.width,
-                y: (rect.top - pageRect.top) / pageRect.height,
-                width: rect.width / pageRect.width,
-                height: rect.height / pageRect.height,
-              };
+                const res = await fetch("http://localhost:8000/annotations", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    file_id: activeFileId,
+                    page_number: ctx.page,
+                    type: "text",
+                    geometry,
+                    text: ctx.text,
+                  }),
+                });
 
-              // Create annotation (source of truth)
-              const res = await fetch("http://localhost:8000/annotations", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  file_id: activeFileId,
-                  page_number: ctx.page,
-                  type: "text",
-                  geometry,
-                  text: ctx.text,
-                }),
-              });
+                const data = await res.json();
 
-              const data = await res.json();
+                setHighlights(prev => [
+                  ...prev,
+                  {
+                    page: ctx.page,
+                    annotation_id: data.annotation_id,
+                    rect: geometry,
+                  },
+                ]);
 
-              // Create highlight at annotation creation time
-              setHighlights(prev => [
-                ...prev,
-                {
-                  page: ctx.page,
-                  annotation_id: data.annotation_id,
-                  rect: geometry,
-                },
-              ]);
+                setActiveAnnotationId(data.annotation_id);
+                setContext(ctx);
 
-              // Enter annotation chat context
-              setActiveAnnotationId(data.annotation_id);
-              setContext(ctx);
+                pendingTextRef.current = null;
+                pendingTextRectRef.current = null;
+                hidePopup();
 
-              // Cleanup transient state
-              pendingTextRef.current = null;
-              pendingTextRectRef.current = null;
-              hidePopup();
-            }}
+                // reset AFTER the click cycle
+                setTimeout(() => {
+                  isClickingPopupRef.current = false;
+                }, 0);
+              }}
+
             style={{
               position: "absolute",
               display: "none",
@@ -873,9 +1505,9 @@ export default function Home() {
         <div
           onMouseDown={() => setIsResizing(true)}
           style={{
-            width: "6px",
+            width: "1.5px",
             cursor: "col-resize",
-            background: "#e0e0e0",
+            background: "transparent",
             userSelect: "none",
           }}
         />
@@ -884,67 +1516,85 @@ export default function Home() {
       <div
         style={{
           width: `${chatWidth}%`,
-          padding: "1rem",
-          borderLeft: "1px solid #ccc",
           display: "flex",
           flexDirection: "column",
+          height: "100%",
+          overflow: "hidden",
         }}
       >
-        <h3
+        {/* Header wrapper */}
+        <div
           style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
+            padding: "1rem",
+            borderBottom: "1px solid #eee",
           }}
         >
-          <span>{activeFileTitle ?? "Conversation"}</span>
-
-          {activeAnnotationId && (
-            <button
-              onClick={() => deleteAnnotation(activeAnnotationId)}
-              style={{
-                background: "transparent",
-                border: "none",
-                color: "#ff6b6b",
-                cursor: "pointer",
-                fontSize: "0.85rem",
-              }}
-            >
-              Delete highlight
-            </button>
-          )}
-        </h3>
-        {chatMode === "annotation" && (
-          <button
-            onClick={async () => {
-              setChatMode("document");
-              setActiveAnnotationId(null);
-              setContext(null);
-
-              if (!activeFileId) return;
-
-              const res = await fetch(
-                `http://localhost:8000/chat/file/${activeFileId}`
-              );
-              const data = await res.json();
-              setMessages(data.messages || []);
-            }}
+          <h3
             style={{
-              marginBottom: "0.75rem",
-              alignSelf: "flex-start",
-              fontSize: "0.85rem",
-              background: "transparent",
-              border: "none",
-              color: "#1976d2",
-              cursor: "pointer",
-              padding: 0,
+              margin: 0,
+              display: "flex",
+              justifyContent: "space-between",
+              fontSize: "1.4rem",
+              alignItems: "center",
             }}
           >
-            ← Back to full conversation
-          </button>
-        )}
+            <span>{activeFileTitle ?? "Conversation"}</span>
 
-        <div style={{ flex: 1, overflowY: "auto", marginBottom: "1rem" }}>
+            {activeAnnotationId && (
+              <button
+                onClick={() => deleteAnnotation(activeAnnotationId)}
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  color: "#ff6b6b",
+                  cursor: "pointer",
+                  fontSize: "0.85rem",
+                }}
+              >
+                Delete highlight
+              </button>
+            )}
+          </h3>
+
+          {chatMode === "annotation" && (
+            <button
+              onClick={async () => {
+                setChatMode("document");
+                setActiveAnnotationId(null);
+                setContext(null);
+
+                if (!activeFileId) return;
+
+                const res = await fetch(
+                  `http://localhost:8000/chat/file/${activeFileId}`
+                );
+                const data = await res.json();
+                setMessages(data.messages || []);
+              }}
+              style={{
+                marginTop: "0.5rem",
+                alignSelf: "flex-start",
+                fontSize: "0.85rem",
+                background: "transparent",
+                border: "none",
+                color: "#1976d2",
+                cursor: "pointer",
+                padding: 0,
+              }}
+            >
+              ← Back to full conversation
+            </button>
+          )}
+        </div>
+
+        {/* Messages */}
+        <div
+          style={{
+            flex: 1,
+            overflowY: "auto",
+            padding: "1rem",
+          }}
+        >
           {messages.map((m, i) => (
             <ChatMessage
               key={`${m.role}-${m.annotation_id ?? "doc"}-${i}`}
@@ -952,54 +1602,50 @@ export default function Home() {
               content={m.content}
               onClick={
                 m.annotation_id
-                  ? async () => {
-                      // Activate annotation
-                      setActiveAnnotationId(m.annotation_id);
-                      setChatMode("annotation");
-
-                      // Fetch annotation metadata
-                      const annotation = await fetchAnnotation(m.annotation_id);
-
-                      // Restore correct context
-                      if (annotation.type === "region") {
-                        setContext({
-                          type: "image",
-                          region_id: annotation.region_id,
-                          page_number: annotation.page_number,
-                        });
-                      } else {
-                        setContext({
-                          type: "text",
-                          page: annotation.page_number,
-                          text: "",
-                        });
-                      }
-
-                      // Load annotation-specific chat
-                      loadAnnotationChat(m.annotation_id);
-
-                      // Scroll to the page
-                      scrollToPage(annotation.page_number);
-                    }
+                  ? () => activateAnnotation(m.annotation_id)
                   : undefined
               }
             />
           ))}
         </div>
 
-        <textarea
-          value={question}
-          onChange={(e) => setQuestion(e.target.value)}
-          style={{ width: "100%", height: "80px" }}
-        />
-
-        <button
-          onClick={askQuestion}
-          disabled={loading || (chatMode === "annotation" && !activeAnnotationId)}
-          style={{ marginTop: "1rem" }}
+        {/* Input */}
+        <div
+          style={{
+            padding: "1rem",
+            background: "transparent",
+          }}
         >
-          {loading ? "Thinking..." : "Ask"}
-        </button>
+          <textarea
+            value={question}
+            onChange={(e) => setQuestion(e.target.value)}
+            style={{
+              width: "95%",
+              height: "80px",
+              borderRadius: UI_RADIUS,
+              border: "1px solid #ccc",
+              padding: "10px",
+              resize: "none",
+              outline: "none",
+            }}
+          />
+
+          <button
+            onClick={askQuestion}
+            disabled={loading || (chatMode === "annotation" && !activeAnnotationId)}
+            style={{
+              marginTop: "0.5rem",
+              width: "100%",
+              borderRadius: UI_RADIUS,
+              padding: "10px 0",
+              border: "1px solid #ccc",
+              background: "#fff",
+              cursor: "pointer",
+            }}
+          >
+            {loading ? "Thinking..." : "Ask"}
+          </button>
+        </div>
       </div>
     </div>
   );

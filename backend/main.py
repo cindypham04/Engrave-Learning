@@ -1,8 +1,6 @@
 from fastapi import FastAPI, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 import os
-import shutil 
-from fastapi.responses import FileResponse
 import uuid
 import fitz
 from pydantic import BaseModel
@@ -10,7 +8,6 @@ from typing import Optional
 from fastapi import HTTPException
 from dotenv import load_dotenv
 from openai import OpenAI
-import base64
 import re
 import json
 import boto3
@@ -29,6 +26,9 @@ from db import (
     commit,
     delete_file_cascade,
     delete_annotation,
+    set_folder_parent,
+    create_folder,
+    rename_folder,
 )
 
 
@@ -86,7 +86,6 @@ def reshape_pages(pages):
 def normalize_math(text: str) -> str:
     lines = text.split("\n")
     normalized = []
-
     buffer = []
 
     def flush_buffer():
@@ -95,26 +94,42 @@ def normalize_math(text: str) -> str:
             normalized.append(f"$$\n{eq}\n$$")
             buffer.clear()
 
+    def looks_like_equation(line: str) -> bool:
+        # Must contain "="
+        if "=" not in line:
+            return False
+
+        # Exclude bullets, headings, or list items
+        if line.lstrip().startswith(("-", "*", "•", "#")):
+            return False
+
+        # Exclude sentences with punctuation typical of prose
+        if any(p in line for p in [".", ",", ";"]):
+            return False
+
+        return True
+
     for line in lines:
         stripped = line.strip()
 
-        # Case 1: already LaTeX math
+        # Already valid LaTeX math
         if stripped.startswith("$$") or stripped.startswith("$"):
             flush_buffer()
             normalized.append(line)
             continue
 
-        # Case 2: looks like a full equation definition
-        if re.match(r"^[A-Za-z][A-Za-z0-9_()]*\s*=\s*.*", stripped):
+        # Equation line
+        if looks_like_equation(stripped):
             buffer.append(stripped)
             continue
 
-        # Otherwise: normal text
+        # Normal text
         flush_buffer()
         normalized.append(line)
 
     flush_buffer()
     return "\n".join(normalized)
+
 
 
 system_prompt = """ 
@@ -124,17 +139,34 @@ Always explain ideas in a way that matches how a learner thinks before they full
 
 Follow these principles for every response:
 
+STRUCTURE RULE:
+
+Write explanations as short, stacked blocks.
+
+Each block should contain 1–2 short sentences.
+Each block should be separated by a blank line.
+
+PREFERRED STYLE:
+
+Prefer multiple short lines over long paragraphs.
+
+If an explanation feels long, split it into stacked lines
+instead of turning it into bullet points.
+
+BULLET RULE:
+
+Use bullet points when explicitly listing items
+(e.g., cases, steps, advantages vs disadvantages).
+
+Use bullet points as many as possible.
+
 1. Start from the learner’s perspective
 
 Assume the student may have partial or fuzzy understanding.
 
-Do not start with formal definitions unless explicitly requested.
+Do NOT start with formal definitions unless explicitly requested.
 
 Identify the underlying question the student is really asking.
-
-Do NOT include meta sentences such as: "Let's break down...", "We'll explain...", "Step by step..."
-
-Every paragraph MUST contain at most 2 sentences. If more explanation is needed, split into multiple parts.
 
 2. Separate intuition from formalism
 
@@ -155,8 +187,6 @@ Introduce one new idea at a time.
 Avoid stacking multiple definitions in one sentence.
 
 Use simple language first; upgrade precision gradually.
-
-Prefer short paragraphs and clear structure.
 
 4. Explain mechanisms, not just results
 
@@ -226,29 +256,15 @@ Do not repeat the same equation in multiple formats.
 
 Never write such expressions as plain text.
 
-13. Formatting rules: 
+13. Formatting rules (STRICT):
 
 Use Markdown formatting.
 
-Section titles MUST use Markdown heading level 2 (##).
-    Example:
-    ## What is the question here?
+Section titles MUST use Markdown heading level 3 (###).
 
-Every paragraph MUST contain at most 2 sentences. If more explanation is needed, split into multiple paragraphs.
+Paragraphs longer than 2 sentences are NOT allowed.
 
-When explaining steps after a phrase like
-  "Let's unpack this piece by piece",
-  you MUST use a numbered list or bullet points.
-
-Give answer in less than 250 words.
-
-Use bullet points as many as possible. 
-For example, instead of saying: 
-"There are two main types of regression: interpolation and extrapolation. Interpolation means predicting values inside the range of your known data, while extrapolation means guessing values outside that range."
-You can say: 
-"There are two main types of regression: 
-- Interpolation: predicting values inside the range of your known data
-- Extrapolation: guessing values outside that range."
+Total response length MUST be under 200 words.
 
 Your success is measured by whether the student could re-explain the idea in their own words after reading your response.
 """
@@ -315,9 +331,18 @@ class AskQuestion(BaseModel):
 class RenameFileRequest(BaseModel):
     title: str
 
+# Change folder title object
+class RenameFolderRequest(BaseModel):
+    title: str
+
+# Create folder
+class CreateFolderRequest(BaseModel):
+    name: str
+    parent_id: Optional[int] = None
+
 # Get the pdf file from frontend then write it into S3
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(file: UploadFile = File(...), folder_id: Optional[int] = Form(None),):
     document_id = str(uuid.uuid4())
     title = os.path.splitext(file.filename)[0]
     user_id = 1
@@ -326,7 +351,7 @@ async def upload_file(file: UploadFile = File(...)):
 
     try:
         file_id = create_file(
-            folder_id=None,
+            folder_id=folder_id,
             document_id=document_id,
             title=title,
             user_id=user_id,
@@ -442,9 +467,7 @@ def upload_region_endpoint(
 
     # Decide extension based on content type
     ext = ".png" if region.content_type == "image/png" else ".jpeg"
-    filename = f"{region_id}{ext}"
 
-    ext = ".png" if region.content_type == "image/png" else ".jpeg"
 
     region_s3_key = upload_region_to_s3(
         file_obj=region.file,
@@ -499,7 +522,11 @@ def ask_document(req: AskQuestion):
     # ---------- Annotation-based mode ----------
     if req.annotation_id:
         annotation = get_annotation(req.annotation_id)
+        if not annotation:
+            raise HTTPException(status_code=404, detail="Annotation not found")
+
         selected_text = annotation.get("text")
+
 
         if not annotation:
             raise HTTPException(status_code=404, detail="Annotation not found")
@@ -624,10 +651,6 @@ def get_document_annotations(file_id: int):
     }
 
 
-@app.get("/folders")
-def get_folders():
-    return {"folders": list_folders(user_id=1)}
-
 @app.get("/files")
 def get_files():
     return {"files": list_files(user_id=1)}
@@ -639,6 +662,16 @@ def rename_file_endpoint(file_id: int, payload: RenameFileRequest):
     if not success:
         raise HTTPException(status_code=404, detail="File not found")
 
+    commit()
+    return {"ok": True}
+
+@app.patch("/folders/{folder_id}/rename")
+def reanme_folder_endpoint(folder_id: int, payload: RenameFolderRequest):
+    success = rename_folder(folder_id, payload.title)
+
+    if not success: 
+        raise HTTPException(status_code=404, detail="Folder not found")
+    
     commit()
     return {"ok": True}
 
@@ -668,12 +701,34 @@ def delete_annotation_endpoint(annotation_id: int):
         rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
-
+@app.get("/folders")
+def list_folders_endpoint(
+    parent_id: Optional[int] = None,
+):
+    user_id = 1  # later from auth
+    return list_folders(user_id=user_id, parent_id=parent_id)
 
 # Debug route 
 @app.get("/debug/page_count")
 def debug_page_count():
     return {"page_count": get_page_count()}
+
+@app.post("/folders")
+def create_folder_endpoint(payload: CreateFolderRequest):
+    user_id = 1
+
+    folder_id = create_folder(payload.name, user_id)
+
+    if payload.parent_id is not None:
+        set_folder_parent(folder_id, payload.parent_id)
+
+    commit()
+
+    return {
+        "id": folder_id,
+        "name": payload.name,
+        "parent_id": payload.parent_id,
+    }
 
 
 # Debug route - load OpenAI
