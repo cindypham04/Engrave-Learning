@@ -72,9 +72,17 @@ type Highlight = {
   };
 };
 
+type ChatThread = {
+  id: number;
+  file_id: number | null;
+  annotation_id: number | null;
+  title: string | null;
+};
+
 /* ---------------- Main Component ---------------- */
 
 export default function Home() {
+  
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
   const [numPages, setNumPages] = useState(0);
 
@@ -108,9 +116,6 @@ export default function Home() {
 
   // State for annotation
   const [activeAnnotationId, setActiveAnnotationId] = useState<number | null>(null);
-
-  // State of document chat or annotation chat
-  const [chatMode, setChatMode] = useState<"document" | "annotation">("document");
 
   // State of file
   const [activeFileId, setActiveFileId] = useState<number | null>(null);
@@ -168,9 +173,17 @@ export default function Home() {
   // Corners of the chat box
   const UI_RADIUS = 12;
 
-
   const pdfContentRef = useRef<HTMLDivElement | null>(null);
   const [pdfContentWidth, setPdfContentWidth] = useState(0);
+
+  // User select current or new chat in the selected text in the chat
+  const pendingChatActionRef = useRef<"current" | "new">("current");
+
+  const popupModeRef = useRef<"chat" | null>(null);
+
+  // Active chat thread state
+  const [chatThreads, setChatThreads] = useState<ChatThread[]>([]);
+  const [activeChatThreadId, setActiveChatThreadId] = useState<number | null>(null);
 
 
   // ---------- load folders (depends on current folder) ----------
@@ -288,6 +301,17 @@ export default function Home() {
     return () => observer.disconnect();
   }, []);
 
+  useEffect(() => {
+    if (!pdfUrl) {
+      popupModeRef.current = null;
+      hidePopup();
+    }
+  }, [pdfUrl]);
+
+  useEffect(() => {
+    if (!activeFileId) return;
+    loadChatThreads(activeFileId);
+  }, [activeFileId]);
 
 
 
@@ -303,14 +327,6 @@ export default function Home() {
   function getContextLabel(ctx: Context) {
     if (ctx.type === "text") return `Text added p.${ctx.page}`;
     return `Region added p.${ctx.page_number}`;
-  }
-
-  async function loadAnnotationChat(annotationId: number) {
-    const res = await fetch(
-      `http://localhost:8000/chat/annotation/${annotationId}`
-    );
-    const data = await res.json();
-    setMessages(data.messages || []);
   }
 
   async function fetchAnnotation(annotationId: number) {
@@ -329,22 +345,23 @@ export default function Home() {
   async function loadFileState(fileId: number) {
     const res = await fetch(`http://localhost:8000/files/${fileId}/state`);
     if (!res.ok) throw new Error("Failed to load file state");
+
     const data = await res.json();
 
     setPdfUrl(data.pdf_url);
-    setMessages(data.messages || []);
-
     setActiveFileTitle(data.file.title);
 
-    const restoredHighlights = (data.annotations || [])
-      .filter((a: any) => a.geometry)
-      .map((a: any) => ({
-        page: a.page_number,
-        annotation_id: a.id,
-        rect: a.geometry,
-      }));
+    setMessages(data.messages || []);
 
-    setHighlights(restoredHighlights);
+    setHighlights(
+      (data.annotations || [])
+        .filter((a: any) => a.geometry)
+        .map((a: any) => ({
+          page: a.page_number,
+          annotation_id: a.id,
+          rect: a.geometry,
+        }))
+    );
   }
 
   /* ---------------- Upload PDF ---------------- */
@@ -440,43 +457,34 @@ export default function Home() {
   }
 
   async function activateAnnotation(annotationId: number) {
-    // Activate annotation
-    setActiveAnnotationId(annotationId);
-    setChatMode("annotation");
-
-    // Fetch annotation metadata
     const annotation = await fetchAnnotation(annotationId);
+    if (!annotation) return;
 
-    if (!annotation) {
-      // Annotation no longer exists — recover gracefully
-      setActiveAnnotationId(null);
-      setContext(null);
-      setChatMode("document");
-      return;
-    }
+    // Visual state
+    setActiveAnnotationId(annotationId);
 
+    // Find the matching chat thread
+    const thread = chatThreads.find(
+      t => t.annotation_id === annotationId
+    );
 
-    // Restore context
-    if (annotation.type === "region") {
-      setContext({
-        type: "image",
-        region_id: annotation.region_id,
-        page_number: annotation.page_number,
-      });
+    if (thread) {
+      setActiveChatThreadId(thread.id);
+      await loadChatThreadMessages(thread.id);
     } else {
-      setContext({
-        type: "text",
-        page: annotation.page_number,
-        text: annotation.text ?? "",
-      });
+      console.warn("No chat thread found for annotation", annotationId);
     }
 
-    // Load annotation-specific chat
-    await loadAnnotationChat(annotationId);
 
-    // Scroll to page
-    scrollToPage(annotation.page_number);
+    // Optional: scroll PDF
+    if (
+      annotation.page_number != null &&
+      annotation.page_number > 0
+    ) {
+      scrollToPage(annotation.page_number);
+    }
   }
+
 
 
   /* ---------------- Rename PDF File ---------------- */
@@ -528,7 +536,6 @@ export default function Home() {
       setContext(null);
       setActiveAnnotationId(null);
       setActiveFileTitle(null);
-      setChatMode("document");
     }
   }
 
@@ -597,19 +604,21 @@ export default function Home() {
       prev.filter(h => h.annotation_id !== annotationId)
     );
 
+    setContext({
+      type: "text",
+      text: ctx.text,
+      page: ctx.page,
+    });
+
     // Exit annotation mode
     setActiveAnnotationId(null);
     setContext(null);
-    setChatMode("document");
 
-    // Reload document-level chat
-    if (activeFileId) {
-      const res = await fetch(
-        `http://localhost:8000/chat/file/${activeFileId}`
-      );
-      const data = await res.json();
-      setMessages(data.messages || []);
+    const docThread = chatThreads.find(t => t.annotation_id === null);
+    if (docThread) {
+      setActiveChatThreadId(docThread.id);
     }
+
   }
 
   const visibleFolders = folders.filter(f =>
@@ -639,6 +648,13 @@ export default function Home() {
 
       const sel = window.getSelection();
       if (!sel || sel.isCollapsed) {
+        popupModeRef.current = null;
+        hidePopup();
+        return;
+      }
+
+      if (!sel || sel.isCollapsed) {
+        popupModeRef.current = null;
         hidePopup();
         return;
       }
@@ -648,19 +664,37 @@ export default function Home() {
 
       const range = sel.getRangeAt(0);
       const rect = range.getBoundingClientRect();
+      const container = range.commonAncestorContainer as HTMLElement;
 
-      let node: any = range.startContainer;
-      let pageNum: number | null = null;
+      const isChatSelection =
+        container.nodeType === Node.TEXT_NODE
+          ? container.parentElement?.closest("[data-chat-message]")
+          : container.closest?.("[data-chat-message]");
 
-      while (node) {
-        if (node.dataset?.pageNumber) {
-          pageNum = Number(node.dataset.pageNumber);
-          break;
-        }
-        node = node.parentNode;
+      // ---------------- CHAT TEXT ----------------
+      if (isChatSelection) {
+        popupModeRef.current = "chat";
+
+        pendingTextRef.current = {
+          type: "text",
+          text,
+          page: -1,
+        };
+
+        pendingTextRectRef.current = rect;
+        showPopup(rect);
+        return;
       }
 
-      if (!pageNum) return;
+
+      // ---------------- PDF TEXT ----------------
+      const pageEl = range.startContainer.parentElement?.closest(
+        "[data-page-number]"
+      );
+
+      if (!pageEl) return;
+
+      const pageNum = Number(pageEl.getAttribute("data-page-number"));
 
       pendingTextRef.current = {
         type: "text",
@@ -668,11 +702,11 @@ export default function Home() {
         page: pageNum,
       };
 
-      // Text: save rect
       pendingTextRectRef.current = rect;
-
       showPopup(rect);
     }
+
+
 
     document.addEventListener("selectionchange", handleSelectionChange);
     return () =>
@@ -690,6 +724,184 @@ export default function Home() {
     if (!popupRef.current) return;
     popupRef.current.style.display = "none";
   }
+
+  async function handlePopupConfirm() {
+    isClickingPopupRef.current = true;
+
+    if (!pendingTextRef.current || !activeFileId) {
+      isClickingPopupRef.current = false;
+      return;
+    }
+
+    const ctx = pendingTextRef.current;
+    const action = pendingChatActionRef.current;
+
+    async function createNewChatThread(
+      fileId: number,
+      annotationId?: number
+    ) {
+      const res = await fetch("http://localhost:8000/chat/threads", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          file_id: fileId,
+          source_annotation_id: annotationId ?? null,
+        }),
+      });
+
+      if (!res.ok) {
+        throw new Error("Failed to create chat thread");
+      }
+
+      return res.json(); // { id, file_id, annotation_id, ... }
+    }
+
+    try {
+      // ===============================
+      // CHAT TEXT (selection from chat)
+      // ===============================
+      if (ctx.page === -1) {
+        const res = await fetch("http://localhost:8000/annotations", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            file_id: activeFileId,
+            page_number: -1,
+            type: "chat_text",
+            text: ctx.text,
+          }),
+        });
+
+        if (!res.ok) {
+          throw new Error("Failed to create chat-text annotation");
+        }
+
+        const data = await res.json();
+
+        if (action === "new") {
+          const thread = await createNewChatThread(
+            activeFileId,
+            data.annotation_id
+          );
+          setActiveChatThreadId(thread.id);
+          setActiveAnnotationId(data.annotation_id);
+        } else {
+          setActiveAnnotationId(data.annotation_id);
+        }
+
+        cleanupPopup();
+        return;
+      }
+
+      // ===============================
+      // PDF TEXT (selection from PDF)
+      // ===============================
+      const rect = pendingTextRectRef.current;
+      const pageEl = pageRefs.current[ctx.page];
+
+      if (!rect || !pageEl) {
+        cleanupPopup();
+        return;
+      }
+
+      const pageRect = pageEl.getBoundingClientRect();
+
+      const geometry = {
+        x: (rect.left - pageRect.left) / pageRect.width,
+        y: (rect.top - pageRect.top) / pageRect.height,
+        width: rect.width / pageRect.width,
+        height: rect.height / pageRect.height,
+      };
+
+      const res = await fetch("http://localhost:8000/annotations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          file_id: activeFileId,
+          page_number: ctx.page,
+          type: "text",
+          geometry,
+          text: ctx.text,
+        }),
+      });
+
+      if (!res.ok) {
+        throw new Error("Failed to create annotation");
+      }
+
+      const data = await res.json();
+
+      // Always add highlight visually
+      setHighlights(prev => [
+        ...prev,
+        {
+          page: ctx.page,
+          annotation_id: data.annotation_id,
+          rect: geometry,
+        },
+      ]);
+
+      setActiveAnnotationId(data.annotation_id);
+      setContext({
+        type: "text",
+        text: ctx.text,
+        page: ctx.page,
+      });
+
+      if (action === "new") {
+        const thread = await createNewChatThread(
+          activeFileId,
+          data.annotation_id
+        );
+
+        await loadChatThreads(activeFileId);
+        
+        setActiveChatThreadId(thread.id);
+        setActiveAnnotationId(data.annotation_id);
+        setContext({
+          type: "text",
+          text: ctx.text,
+          page: ctx.page,
+        });
+
+      } else {
+        // Attach to document chat thread
+        const docThread = chatThreads.find(
+          t => t.annotation_id === null
+        );
+
+        if (docThread) {
+          setActiveChatThreadId(docThread.id);
+        }
+
+        setActiveAnnotationId(data.annotation_id);
+      }
+
+      cleanupPopup();
+    } catch (err) {
+      console.error(err);
+      cleanupPopup();
+    }
+    if (activeChatThreadId) {
+      await loadChatThreadMessages(activeChatThreadId);
+    }
+  }
+
+
+
+  function cleanupPopup() {
+    pendingTextRef.current = null;
+    pendingTextRectRef.current = null;
+    popupModeRef.current = null;
+    pendingChatActionRef.current = "current";
+    hidePopup();
+    window.getSelection()?.removeAllRanges();
+
+    setTimeout(() => {
+      isClickingPopupRef.current = false;
+    }, 0);
+  }
+
 
   /* ---------------- Region upload ---------------- */
 
@@ -774,32 +986,32 @@ export default function Home() {
   async function askQuestion() {
     if (!activeFileId) return;
 
-    const page =
-      context?.type === "text"
-        ? context.page
-        : context?.type === "image"
-        ? context.page_number
-        : undefined;
+    // fallback safety net
+    let threadId = activeChatThreadId;
 
+    if (!threadId) {
+      const docThread = chatThreads.find(t => t.annotation_id === null);
+      if (!docThread) return;
+      threadId = docThread.id;
+      setActiveChatThreadId(threadId);
+    }
 
     const userMsg: ChatMsg = {
       role: "user",
       content: question || "Explain this in simple terms.",
       annotation_id: activeAnnotationId ?? undefined,
-      ...(page ? { reference: { page } } : {}),
     };
-
 
     setMessages(prev => [...prev, userMsg]);
     setQuestion("");
     setLoading(true);
-
 
     const res = await fetch("http://localhost:8000/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         file_id: activeFileId,
+        chat_thread_id: threadId,
         annotation_id: activeAnnotationId,
         question: userMsg.content,
       }),
@@ -814,6 +1026,53 @@ export default function Home() {
 
     setLoading(false);
   }
+
+
+  async function loadChatThreadMessages(threadId: number) {
+    const res = await fetch(
+      `http://localhost:8000/chat/thread/${threadId}`
+    );
+
+    if (!res.ok) return;
+
+    const data = await res.json();
+    setMessages(data.messages || []);
+  }
+
+
+  async function loadChatThreads(fileId: number) {
+    const res = await fetch(
+      `http://localhost:8000/chat/threads?file_id=${fileId}`
+    );
+    if (!res.ok) return;
+
+    const data = await res.json();
+    let threads: ChatThread[] = data.threads || [];
+
+    // If no document thread exists, create one
+    let docThread = threads.find(t => t.annotation_id === null);
+
+    if (!docThread) {
+      const createRes = await fetch("http://localhost:8000/chat/threads", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file_id: fileId }),
+      });
+
+      const created = await createRes.json();
+      docThread = { id: created.id, file_id: fileId, annotation_id: null, title: null };
+      threads = [...threads, docThread];
+    }
+
+    setChatThreads(threads);
+    setActiveChatThreadId(docThread.id);
+
+    await loadChatThreadMessages(docThread.id);
+  }
+
+
+
+
 
   /* ---------------- UI ---------------- */
   return (
@@ -1095,10 +1354,10 @@ export default function Home() {
                 if (renamingFileId === file.id) return;
                 if (fileActionsOpenId === file.id) return;
 
-                setActiveFileId(file.id);
-                setChatMode("document");
+                  setActiveFileId(file.id);
                 setActiveAnnotationId(null);
                 setContext(null);
+
               }}
               style={{
                 position: "relative",
@@ -1425,80 +1684,7 @@ export default function Home() {
           </Document>
         )}
 
-        {!regionMode && (
-          <div
-              ref={popupRef}
-              onMouseDown={async (e) => {
-                e.preventDefault(); // 👈 critical
-                isClickingPopupRef.current = true;
 
-                if (!pendingTextRef.current || !activeFileId) return;
-                const ctx = pendingTextRef.current;
-                if (ctx.type !== "text") return;
-
-                const rect = pendingTextRectRef.current;
-                const pageEl = pageRefs.current[ctx.page];
-                if (!rect || !pageEl) return;
-
-                const pageRect = pageEl.getBoundingClientRect();
-
-                const geometry = {
-                  x: (rect.left - pageRect.left) / pageRect.width,
-                  y: (rect.top - pageRect.top) / pageRect.height,
-                  width: rect.width / pageRect.width,
-                  height: rect.height / pageRect.height,
-                };
-
-                const res = await fetch("http://localhost:8000/annotations", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    file_id: activeFileId,
-                    page_number: ctx.page,
-                    type: "text",
-                    geometry,
-                    text: ctx.text,
-                  }),
-                });
-
-                const data = await res.json();
-
-                setHighlights(prev => [
-                  ...prev,
-                  {
-                    page: ctx.page,
-                    annotation_id: data.annotation_id,
-                    rect: geometry,
-                  },
-                ]);
-
-                setActiveAnnotationId(data.annotation_id);
-                setContext(ctx);
-
-                pendingTextRef.current = null;
-                pendingTextRectRef.current = null;
-                hidePopup();
-
-                // reset AFTER the click cycle
-                setTimeout(() => {
-                  isClickingPopupRef.current = false;
-                }, 0);
-              }}
-
-            style={{
-              position: "absolute",
-              display: "none",
-              background: "#111",
-              color: "#fff",
-              padding: "6px 10px",
-              borderRadius: "6px",
-              cursor: "pointer",
-              zIndex: 1000,
-            }}
-          >
-            Add to chat
-          </div>
-        )}
       </div>
 
       {/* Resize Handle */}
@@ -1555,36 +1741,6 @@ export default function Home() {
               </button>
             )}
           </h3>
-
-          {chatMode === "annotation" && (
-            <button
-              onClick={async () => {
-                setChatMode("document");
-                setActiveAnnotationId(null);
-                setContext(null);
-
-                if (!activeFileId) return;
-
-                const res = await fetch(
-                  `http://localhost:8000/chat/file/${activeFileId}`
-                );
-                const data = await res.json();
-                setMessages(data.messages || []);
-              }}
-              style={{
-                marginTop: "0.5rem",
-                alignSelf: "flex-start",
-                fontSize: "0.85rem",
-                background: "transparent",
-                border: "none",
-                color: "#1976d2",
-                cursor: "pointer",
-                padding: 0,
-              }}
-            >
-              ← Back to full conversation
-            </button>
-          )}
         </div>
 
         {/* Messages */}
@@ -1597,11 +1753,11 @@ export default function Home() {
         >
           {messages.map((m, i) => (
             <ChatMessage
-              key={`${m.role}-${m.annotation_id ?? "doc"}-${i}`}
+              key={`${m.role}-${i}-${m.annotation_id ?? "doc"}`}
               role={m.role}
               content={m.content}
               onClick={
-                m.annotation_id
+                m.role === "user" && m.annotation_id
                   ? () => activateAnnotation(m.annotation_id)
                   : undefined
               }
@@ -1632,7 +1788,7 @@ export default function Home() {
 
           <button
             onClick={askQuestion}
-            disabled={loading || (chatMode === "annotation" && !activeAnnotationId)}
+            disabled={loading || !activeChatThreadId}
             style={{
               marginTop: "0.5rem",
               width: "100%",
@@ -1647,6 +1803,61 @@ export default function Home() {
           </button>
         </div>
       </div>
+      {!regionMode && (
+          <div
+            ref={popupRef}
+            style={{
+              position: "absolute",
+              display: "none",
+              background: "#111",
+              color: "#fff",
+              padding: "6px",
+              borderRadius: "6px",
+              zIndex: 1000,
+              fontSize: "0.85rem",
+              display: "flex",
+              gap: "6px",
+            }}
+          >
+            {popupModeRef.current === "chat" ? (
+              <>
+                <span
+                  style={{ cursor: "pointer", padding: "4px 6px" }}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    pendingChatActionRef.current = "current";
+                    handlePopupConfirm();
+                  }}
+                >
+                  Current chat
+                </span>
+
+                <span style={{ opacity: 0.4 }}>|</span>
+
+                <span
+                  style={{ cursor: "pointer", padding: "4px 6px" }}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    pendingChatActionRef.current = "new";
+                    handlePopupConfirm();
+                  }}
+                >
+                  New chat
+                </span>
+              </>
+            ) : (
+              <span
+                style={{ cursor: "pointer", padding: "4px 6px" }}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  handlePopupConfirm(); // PDF → Add to chat
+                }}
+              >
+                Add to chat
+              </span>
+            )}
+          </div>
+        )}
     </div>
   );
 }

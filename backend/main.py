@@ -4,7 +4,7 @@ import os
 import uuid
 import fitz
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Literal
 from fastapi import HTTPException
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -29,6 +29,10 @@ from db import (
     set_folder_parent,
     create_folder,
     rename_folder,
+    save_message_to_thread,
+    get_chat_threads_by_file,
+    get_messages_by_thread,
+    create_chat_thread,
 )
 
 
@@ -317,13 +321,14 @@ def ask_region(prompt_text: str, region_s3_key: str, system_prompt=system_prompt
 class CreateAnnotation(BaseModel):
     file_id: int
     page_number: int
-    type: str
+    type: Literal["text", "region", "chat_text"]
     geometry: Optional[dict] = None
     text: Optional[str] = None
 
 # Store Ask Question objects
 class AskQuestion(BaseModel):
     file_id: int
+    chat_thread_id: int 
     annotation_id: Optional[int] = None
     question: str
 
@@ -339,6 +344,12 @@ class RenameFolderRequest(BaseModel):
 class CreateFolderRequest(BaseModel):
     name: str
     parent_id: Optional[int] = None
+
+class CreateChatThread(BaseModel):
+    file_id: int
+    source_annotation_id: Optional[int] = None
+    title: Optional[str] = None
+
 
 # Get the pdf file from frontend then write it into S3
 @app.post("/upload")
@@ -386,6 +397,18 @@ def create_text_annotation(payload: CreateAnnotation):
     if not document_id:
         raise HTTPException(status_code=404, detail="File not found")
 
+    # Chat-text annotations (LLM response selection)
+    if payload.type == "chat_text":
+        annotation_id = create_annotation(
+            document_id=document_id,
+            page_number=0,          
+            type="chat_text",
+            geometry=None,
+            text=payload.text,
+        )
+        return {"annotation_id": annotation_id}
+
+    # PDF text / region annotations
     annotation_id = create_annotation(
         document_id=document_id,
         page_number=payload.page_number,
@@ -394,6 +417,7 @@ def create_text_annotation(payload: CreateAnnotation):
         text=payload.text,
     )
     return {"annotation_id": annotation_id}
+
 
 # Return “file metadata” 
 @app.get("/files/{file_id}/meta")
@@ -505,6 +529,12 @@ def ask_document(req: AskQuestion):
     document_id = get_document_id_by_file(req.file_id)
     if not document_id:
         raise HTTPException(status_code=404, detail="File not found")
+    
+    if req.chat_thread_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="chat_thread_id is required"
+        )
 
     pages = get_pages(document_id)
 
@@ -513,12 +543,14 @@ def ask_document(req: AskQuestion):
         return {"answer": "Document not found."}
     
     # Save user message first
-    save_message(
-        document_id = document_id,
-        role = "user",
-        content = req.question,
-        annotation_id = req.annotation_id,
+    save_message_to_thread(
+        chat_thread_id=req.chat_thread_id,
+        document_id=document_id,
+        role="user",
+        content=req.question,
+        annotation_id=req.annotation_id,
     )
+
     # ---------- Annotation-based mode ----------
     if req.annotation_id:
         annotation = get_annotation(req.annotation_id)
@@ -526,10 +558,6 @@ def ask_document(req: AskQuestion):
             raise HTTPException(status_code=404, detail="Annotation not found")
 
         selected_text = annotation.get("text")
-
-
-        if not annotation:
-            raise HTTPException(status_code=404, detail="Annotation not found")
 
         if annotation["document_id"] != document_id:
             raise HTTPException(status_code=400, detail="Annotation mismatch")
@@ -539,12 +567,6 @@ def ask_document(req: AskQuestion):
         prev_text = pages[page_idx - 1]["text"] if page_idx - 1 >= 0 else ""
         curr_text = pages[page_idx]["text"]
         next_text = pages[page_idx + 1]["text"] if page_idx + 1 < len(pages) else ""
-
-        history = get_messages_by_annotation(req.annotation_id)
-        history_text = "\n".join(
-            f"{m['role']}: {m['content']}"
-            for m in history
-        )
 
         prompt = f"""
 The student selected the following exact text from the document:
@@ -584,12 +606,14 @@ Question:
 
         answer = normalize_math(answer)
 
-        save_message(
+        save_message_to_thread(
+            chat_thread_id=req.chat_thread_id,
             document_id=document_id,
             role="assistant",
             content=answer,
             annotation_id=req.annotation_id,
         )
+
 
         return {"answer": answer}
 
@@ -606,12 +630,14 @@ Question:
     answer = ask_openai(prompt_text=prompt)
     answer = normalize_math(answer)
 
-    save_message(
-        document_id=document_id,
-        role="assistant",
-        content=answer,
-        annotation_id=None,
-    )
+    save_message_to_thread(
+    chat_thread_id=req.chat_thread_id,
+    document_id=document_id,
+    role="assistant",
+    content=answer,
+    annotation_id=req.annotation_id,
+)
+
 
     return {"answer": answer}
 
@@ -707,6 +733,25 @@ def list_folders_endpoint(
 ):
     user_id = 1  # later from auth
     return list_folders(user_id=user_id, parent_id=parent_id)
+
+@app.get("/chat/threads")
+def get_threads(file_id: int):
+    return {"threads": get_chat_threads_by_file(file_id)}
+
+@app.get("/chat/thread/{thread_id}")
+def get_thread_messages(thread_id: int):
+    return {"messages": get_messages_by_thread(thread_id)}
+
+@app.post("/chat/threads")
+def create_thread(payload: CreateChatThread):
+    thread_id = create_chat_thread(
+        file_id=payload.file_id,
+        source_annotation_id=payload.source_annotation_id,
+        title=payload.title,
+    )
+    commit()
+    return {"id": thread_id}
+
 
 # Debug route 
 @app.get("/debug/page_count")

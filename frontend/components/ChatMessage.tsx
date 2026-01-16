@@ -22,6 +22,7 @@ export default function ChatMessage({
 
   return (
     <div
+      data-chat-message
       onClick={onClick}
       style={{
         marginBottom: "1rem",
@@ -30,9 +31,9 @@ export default function ChatMessage({
         background: isUser ? "#e5f0ff" : "transparent",
         color: "var(--text-main)",
         cursor: onClick ? "pointer" : "default",
-        fontSize: "16px",   
-        lineHeight: "1.6",     
-        }}
+        fontSize: "16px",
+        lineHeight: "1.6",
+      }}
     >
       <ReactMarkdown
         remarkPlugins={[remarkMath]}

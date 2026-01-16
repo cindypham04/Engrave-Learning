@@ -484,7 +484,174 @@ def set_folder_parent(folder_id: int, parent_id: Optional[int]):
         (parent_id, folder_id)
     )
 
+# ======================================================
+# Chat
+# ======================================================
 
+def migrate_add_chat_thread_id_to_messages():
+    cur = get_cursor()
+
+    # Check if column already exists
+    cur.execute("PRAGMA table_info(messages)")
+    columns = [row[1] for row in cur.fetchall()]
+
+    if "chat_thread_id" not in columns:
+        cur.execute(
+            "ALTER TABLE messages ADD COLUMN chat_thread_id INTEGER"
+        )
+
+def init_chat_threads():
+    cur = get_cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS chat_threads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id INTEGER NULL,
+        source_annotation_id INTEGER NULL,
+        title TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (file_id) REFERENCES files(id),
+        FOREIGN KEY (source_annotation_id) REFERENCES annotations(id)
+    )
+    """)
+
+def create_chat_thread(
+    file_id: Optional[int] = None,
+    source_annotation_id: Optional[int] = None,
+    title: Optional[str] = None,
+):
+    cur = get_cursor()
+    cur.execute(
+        """
+        INSERT INTO chat_threads (file_id, source_annotation_id, title)
+        VALUES (?, ?, ?)
+        """,
+        (file_id, source_annotation_id, title),
+    )
+    return cur.lastrowid
+
+def get_chat_threads_by_file(file_id: int):
+    cur = get_cursor()
+    cur.execute(
+        """
+        SELECT id, source_annotation_id, title
+        FROM chat_threads
+        WHERE file_id = ?
+        ORDER BY created_at ASC
+        """,
+        (file_id,),
+    )
+    return [
+        {
+            "id": r[0],
+            "source_annotation_id": r[1],
+            "title": r[2],
+        }
+        for r in cur.fetchall()
+    ]
+
+def save_message_to_thread(
+    chat_thread_id: int,
+    document_id: str,
+    role: str,
+    content: str,
+    annotation_id: Optional[int] = None,
+    reference: Optional[dict] = None,
+):
+    cur = get_cursor()
+    cur.execute(
+        """
+        INSERT INTO messages (
+            chat_thread_id,
+            document_id,
+            role,
+            content,
+            annotation_id,
+            reference
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            chat_thread_id,
+            document_id,
+            role,
+            content,
+            annotation_id,
+            json.dumps(reference) if reference else None,
+        ),
+    )
+
+def get_messages_by_thread(chat_thread_id: int):
+    cur = get_cursor()
+    cur.execute(
+        """
+        SELECT role, content, annotation_id, reference
+        FROM messages
+        WHERE chat_thread_id = ?
+        ORDER BY created_at ASC
+        """,
+        (chat_thread_id,),
+    )
+    return [
+        {
+            "role": r[0],
+            "content": r[1],
+            "annotation_id": r[2],
+            "reference": json.loads(r[3]) if r[3] else None,
+        }
+        for r in cur.fetchall()
+    ]
+
+def migrate_create_chat_threads_from_existing_data():
+    cur = get_cursor()
+
+    # 1. Document-level chats (one per file)
+    cur.execute("SELECT id, document_id, title FROM files")
+    files = cur.fetchall()
+
+    file_thread_map = {}
+
+    for file_id, document_id, title in files:
+        thread_id = create_chat_thread(
+            file_id=file_id,
+            source_annotation_id=None,
+            title=title or "Document chat",
+        )
+        file_thread_map[document_id] = thread_id
+
+    # 2. Annotation-level chats
+    cur.execute("SELECT id, document_id, page_number FROM annotations")
+    annotations = cur.fetchall()
+
+    annotation_thread_map = {}
+
+    for annotation_id, document_id, page_number in annotations:
+        thread_id = create_chat_thread(
+            file_id=None,
+            source_annotation_id=annotation_id,
+            title=f"Highlight p.{page_number}",
+        )
+        annotation_thread_map[annotation_id] = thread_id
+
+    # 3. Attach messages to threads
+    cur.execute(
+        "SELECT id, document_id, annotation_id FROM messages"
+    )
+    messages = cur.fetchall()
+
+    for msg_id, document_id, annotation_id in messages:
+        if annotation_id and annotation_id in annotation_thread_map:
+            thread_id = annotation_thread_map[annotation_id]
+        else:
+            thread_id = file_thread_map.get(document_id)
+
+        cur.execute(
+            """
+            UPDATE messages
+            SET chat_thread_id = ?
+            WHERE id = ?
+            """,
+            (thread_id, msg_id),
+        )
 
 # ======================================================
 # Init everything ONCE
@@ -496,7 +663,8 @@ init_annotations()
 init_users()
 init_folders()
 init_files()
-
+migrate_add_chat_thread_id_to_messages()
+init_chat_threads()
 
 def rollback():
     conn.rollback()
