@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import "react-pdf/dist/Page/TextLayer.css";
 import "react-pdf/dist/Page/AnnotationLayer.css";
+import { start } from "repl";
 
 const ChatMessage = dynamic(
   () => import("../../components/ChatMessage"),
@@ -53,6 +54,7 @@ type DragRect = {
 };
 
 type ChatMsg = {
+  id?: number;
   role: "user" | "assistant";
   content: string;
   annotation_id?: number;
@@ -75,9 +77,17 @@ type Highlight = {
 type ChatThread = {
   id: number;
   file_id: number | null;
-  annotation_id: number | null;
+  source_annotation_id: number | null;
   title: string | null;
 };
+
+type ChatHighlight = {
+  annotation_id: number;
+  message_id: number;
+  start: number;
+  end: number;
+  };
+
 
 /* ---------------- Main Component ---------------- */
 
@@ -96,8 +106,17 @@ export default function Home() {
 
   // chat
   const [question, setQuestion] = useState("");
-  const [messages, setMessages] = useState<ChatMsg[]>([]);
+  const [allMessages, setAllMessages] = useState<ChatMsg[]>([]);
+  const [visibleMessages, setVisibleMessages] = useState<ChatMsg[]>([]);
   const [loading, setLoading] = useState(false);
+  const [secondaryQuestion, setSecondaryQuestion] = useState("");
+  const [secondaryMessages, setSecondaryMessages] = useState<ChatMsg[]>([]);
+  const [secondaryVisibleMessages, setSecondaryVisibleMessages] = useState<ChatMsg[]>([]);
+  const [secondaryLoading, setSecondaryLoading] = useState(false);
+  const [secondaryPanelOpen, setSecondaryPanelOpen] = useState(false);
+  const [secondaryFileId, setSecondaryFileId] = useState<number | null>(null);
+  const [secondaryFileTitle, setSecondaryFileTitle] = useState<string | null>(null);
+  const [secondaryPendingTitle, setSecondaryPendingTitle] = useState<string | null>(null);
 
   const popupRef = useRef<HTMLDivElement | null>(null);
   const pendingTextRef = useRef<TextContext | null>(null);
@@ -111,14 +130,28 @@ export default function Home() {
 
   const isClickingPopupRef = useRef(false);
 
+  // Track the “current file version”
+  const activeFileVersionRef = useRef(0);
+
+  // Store chat selection in LLM response info immediately
+  const pendingChatHighlightRef = useRef<{
+    messageId: number;
+    start: number;
+    end: number;
+    panelId: "primary" | "secondary";
+  } | null>(null);
+
+
   // Stored highlights
   const [highlights, setHighlights] = useState<Highlight[]>([]);
 
   // State for annotation
   const [activeAnnotationId, setActiveAnnotationId] = useState<number | null>(null);
+  const [secondaryActiveAnnotationId, setSecondaryActiveAnnotationId] = useState<number | null>(null);
 
   // State of file
   const [activeFileId, setActiveFileId] = useState<number | null>(null);
+  const [activeFileFolderId, setActiveFileFolderId] = useState<number | null>(null);
 
   // State of sidebar
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -179,11 +212,25 @@ export default function Home() {
   // User select current or new chat in the selected text in the chat
   const pendingChatActionRef = useRef<"current" | "new">("current");
 
-  const popupModeRef = useRef<"chat" | null>(null);
+  const [popupMode, setPopupMode] = useState<"chat" | "pdf" | null>(null);
 
   // Active chat thread state
   const [chatThreads, setChatThreads] = useState<ChatThread[]>([]);
   const [activeChatThreadId, setActiveChatThreadId] = useState<number | null>(null);
+  const [secondaryChatThreadId, setSecondaryChatThreadId] = useState<number | null>(null);
+
+  // LLM response highlight state
+  const [chatHighlights, setChatHighlights] = useState<ChatHighlight[]>([]);
+
+  // track “just showed popup”
+  const justOpenedPopupRef = useRef(false);
+
+  const messageRefs = useRef<Record<number, HTMLDivElement | null>>({});
+  const messagesContainerRef = useRef<HTMLDivElement | null>(null);
+  const lastFullChatScrollTopRef = useRef<number | null>(null);
+  const secondaryMessagesContainerRef = useRef<HTMLDivElement | null>(null);
+  const secondaryLastFullChatScrollTopRef = useRef<number | null>(null);
+
 
 
   // ---------- load folders (depends on current folder) ----------
@@ -283,6 +330,7 @@ export default function Home() {
 
   // Adjusting pdf width to be the same as range
   useEffect(() => {
+    if (pdfUrl === null) return;
     if (!pdfContentRef.current) return;
 
     const el = pdfContentRef.current;
@@ -290,28 +338,20 @@ export default function Home() {
     const observer = new ResizeObserver(entries => {
       const entry = entries[0];
       if (!entry) return;
-
       setPdfContentWidth(entry.contentRect.width);
     });
 
-    requestAnimationFrame(() => {
-      observer.observe(el);
-    });
-
+    observer.observe(el);
     return () => observer.disconnect();
-  }, []);
+  }, [pdfUrl]);
+
 
   useEffect(() => {
     if (!pdfUrl) {
-      popupModeRef.current = null;
+      setPopupMode(null);
       hidePopup();
     }
   }, [pdfUrl]);
-
-  useEffect(() => {
-    if (!activeFileId) return;
-    loadChatThreads(activeFileId);
-  }, [activeFileId]);
 
 
 
@@ -329,6 +369,32 @@ export default function Home() {
     return `Region added p.${ctx.page_number}`;
   }
 
+  function cleanChatTitle(raw: string) {
+    const cleaned = raw
+      .replace(/^["'“”]+|["'“”]+$/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!cleaned) return "New Chat";
+    return cleaned.length > 48 ? `${cleaned.slice(0, 48)}...` : cleaned;
+  }
+
+  async function createStandaloneChat(title: string) {
+    const res = await fetch("http://localhost:8000/chat/standalone", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        folder_id: activeFileFolderId,
+        title,
+      }),
+    });
+
+    if (!res.ok) {
+      throw new Error("Failed to create standalone chat");
+    }
+
+    return res.json();
+  }
+
   async function fetchAnnotation(annotationId: number) {
     const res = await fetch(
       `http://localhost:8000/annotations/${annotationId}`
@@ -341,17 +407,83 @@ export default function Home() {
     return res.json();
   }
 
+  async function backToFullConversation(panelId: "primary" | "secondary") {
+    const isSecondary = panelId === "secondary";
+    if (isSecondary) {
+      setSecondaryActiveAnnotationId(null);
+    } else {
+      setActiveAnnotationId(null);
+    }
+
+    const threadId = isSecondary ? secondaryChatThreadId : activeChatThreadId;
+    if (!threadId) return;
+
+    const messages = await loadChatThreadMessages(threadId, panelId);
+    if (!messages) return;
+
+    const scrollTop = isSecondary
+      ? secondaryLastFullChatScrollTopRef.current
+      : lastFullChatScrollTopRef.current;
+    const containerRef = isSecondary
+      ? secondaryMessagesContainerRef.current
+      : messagesContainerRef.current;
+
+    if (scrollTop !== null && containerRef) {
+      setTimeout(() => {
+        containerRef.scrollTo({
+          top: scrollTop,
+          behavior: "smooth",
+        });
+      }, 0);
+    }
+  }
+
 
   async function loadFileState(fileId: number) {
+    const versionAtCall = activeFileVersionRef.current;
+
     const res = await fetch(`http://localhost:8000/files/${fileId}/state`);
-    if (!res.ok) throw new Error("Failed to load file state");
+    if (!res.ok) return;
+
+    if (versionAtCall !== activeFileVersionRef.current) return;
 
     const data = await res.json();
 
-    setPdfUrl(data.pdf_url);
+    // ---------- COMMON ----------
     setActiveFileTitle(data.file.title);
+    setActiveFileFolderId(data.file.folder_id ?? null);
+    setChatThreads(data.threads || []);
 
-    setMessages(data.messages || []);
+    // ---------- CHAT FILE ----------
+    if (data.type === "chat") {
+      setPdfUrl(null);
+      setNumPages(0);
+      setHighlights([]);
+      setChatHighlights(data.chat_highlights || []);
+      setContext(null);
+      setActiveAnnotationId(null);
+      setSecondaryActiveAnnotationId(null);
+
+      setActiveChatThreadId(data.active_thread_id);
+      setAllMessages(data.messages || []);
+      setVisibleMessages(data.messages || []);
+      setSecondaryChatThreadId(null);
+      setSecondaryFileId(null);
+      setSecondaryFileTitle(null);
+      setSecondaryPendingTitle(null);
+      setSecondaryMessages([]);
+      setSecondaryVisibleMessages([]);
+      setSecondaryQuestion("");
+      setSecondaryPanelOpen(false);
+      return;
+    }
+
+    // ---------- PDF FILE ----------
+    setPdfUrl(data.pdf_url);
+
+    setActiveChatThreadId(data.active_thread_id);
+    setAllMessages(data.messages || []);
+    setVisibleMessages(data.messages || []);
 
     setHighlights(
       (data.annotations || [])
@@ -362,7 +494,18 @@ export default function Home() {
           rect: a.geometry,
         }))
     );
+    setChatHighlights(data.chat_highlights || []);
+    setSecondaryChatThreadId(null);
+    setSecondaryFileId(null);
+    setSecondaryFileTitle(null);
+    setSecondaryPendingTitle(null);
+    setSecondaryMessages([]);
+    setSecondaryVisibleMessages([]);
+    setSecondaryQuestion("");
+    setSecondaryActiveAnnotationId(null);
+    setSecondaryPanelOpen(false);
   }
+
 
   /* ---------------- Upload PDF ---------------- */
 
@@ -399,6 +542,8 @@ export default function Home() {
       ...prev,
     ]);
 
+
+    activeFileVersionRef.current += 1;
 
     setActiveFileId(data.file_id);
     setContext(null);
@@ -443,47 +588,143 @@ export default function Home() {
     );
   }
 
+  function ChatIcon({ size = 14 }: { size?: number }) {
+    return (
+      <svg
+        width={size}
+        height={size}
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        style={{ marginRight: 6, opacity: 0.7 }}
+      >
+        <path d="M21 15a4 4 0 0 1-4 4H7l-4 4V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z" />
+      </svg>
+    );
+  }
+
+
 
   /* ---------------- Delete Folder ---------------- */
   async function deleteFolder(folderId: number) {
     const ok = confirm("Delete this folder and all its contents?");
     if (!ok) return;
 
-    await fetch(`http://localhost:8000/folders/${folderId}`, {
+    const res = await fetch(`http://localhost:8000/folders/${folderId}`, {
       method: "DELETE",
     });
 
+    if (!res.ok) {
+      alert("Failed to delete folder");
+      return;
+    }
+
+    // Remove folder
     setFolders(prev => prev.filter(f => f.id !== folderId));
+
+    // Find files inside this folder
+    const removedFiles = files.filter(f => f.folder_id === folderId);
+
+    // Remove those files from sidebar
+    setFiles(prev => prev.filter(f => f.folder_id !== folderId));
+
+    // If active file was inside deleted folder → reset UI
+    if (activeFileId && removedFiles.some(f => f.id === activeFileId)) {
+      activeFileVersionRef.current += 1;
+
+      setActiveFileId(null);
+      setPdfUrl(null);
+      setAllMessages([]);
+      setVisibleMessages([]);
+      setHighlights([]);
+      setChatThreads([]);
+      setContext(null);
+      setActiveAnnotationId(null);
+      setActiveChatThreadId(null);
+      setActiveFileTitle(null);
+      setActiveFileFolderId(null);
+      setSecondaryChatThreadId(null);
+      setSecondaryFileId(null);
+      setSecondaryFileTitle(null);
+      setSecondaryPendingTitle(null);
+      setSecondaryMessages([]);
+      setSecondaryVisibleMessages([]);
+      setSecondaryQuestion("");
+      setSecondaryActiveAnnotationId(null);
+      setSecondaryPanelOpen(false);
+    }
+
+    // If user is currently inside the deleted folder → go up
+    if (currentFolderId === folderId) {
+      const prevId = folderStack.at(-1) ?? null;
+      setCurrentFolderId(prevId);
+      setFolderStack(prev => prev.slice(0, -1));
+    }
   }
 
-  async function activateAnnotation(annotationId: number) {
+
+  async function activateAnnotation(
+    annotationId: number,
+    panelId: "primary" | "secondary"
+  ) {
     const annotation = await fetchAnnotation(annotationId);
     if (!annotation) return;
 
-    // Visual state
-    setActiveAnnotationId(annotationId);
-
-    // Find the matching chat thread
-    const thread = chatThreads.find(
-      t => t.annotation_id === annotationId
-    );
-
-    if (thread) {
-      setActiveChatThreadId(thread.id);
-      await loadChatThreadMessages(thread.id);
-    } else {
-      console.warn("No chat thread found for annotation", annotationId);
+    const isSecondary = panelId === "secondary";
+    const containerRef = isSecondary
+      ? secondaryMessagesContainerRef.current
+      : messagesContainerRef.current;
+    if (containerRef) {
+      if (isSecondary) {
+        secondaryLastFullChatScrollTopRef.current = containerRef.scrollTop;
+      } else {
+        lastFullChatScrollTopRef.current = containerRef.scrollTop;
+      }
     }
 
+    if (isSecondary) {
+      setSecondaryActiveAnnotationId(annotationId);
+    } else {
+      setActiveAnnotationId(annotationId);
+    }
 
-    // Optional: scroll PDF
-    if (
-      annotation.page_number != null &&
-      annotation.page_number > 0
-    ) {
+    const threadId = isSecondary ? secondaryChatThreadId : activeChatThreadId;
+    if (!threadId) return;
+
+    let baseMessages = isSecondary ? secondaryMessages : allMessages;
+    if ((isSecondary ? secondaryChatThreadId : activeChatThreadId) !== threadId) {
+      const loaded = await loadChatThreadMessages(threadId, panelId);
+      if (loaded) {
+        baseMessages = loaded;
+      }
+    }
+
+    const filtered = baseMessages.filter(
+      m => m.annotation_id === annotationId
+    );
+    if (isSecondary) {
+      setSecondaryVisibleMessages(filtered);
+    } else {
+      setVisibleMessages(filtered);
+    }
+
+    const firstUser = filtered.find(m => m.role === "user" && m.id);
+    if (firstUser?.id) {
+      setTimeout(() => {
+        const el = messageRefs.current[firstUser.id];
+        el?.scrollIntoView({ behavior: "smooth", block: "center" });
+      }, 0);
+    }
+
+    // 4. Scroll PDF (optional)
+    if (annotation.page_number > 0) {
       scrollToPage(annotation.page_number);
     }
   }
+
 
 
 
@@ -529,12 +770,19 @@ export default function Home() {
 
     // If deleting the active file, clear UI state
     if (activeFileId === fileId) {
+      activeFileVersionRef.current += 1;
+
       setActiveFileId(null);
       setPdfUrl(null);
-      setMessages([]);
+
+      setAllMessages([]);
+      setVisibleMessages([]);
       setHighlights([]);
+      setChatThreads([]);
+
       setContext(null);
       setActiveAnnotationId(null);
+      setActiveChatThreadId(null);
       setActiveFileTitle(null);
     }
   }
@@ -583,9 +831,76 @@ export default function Home() {
     }
   }
 
+  /* ---------------- Centralize chat switching ---------------- */
+  async function switchToThread(threadId: number) {
+    setActiveChatThreadId(threadId);
+    await loadChatThreadMessages(threadId, "primary");
+  }
+
+  function getSelectionOffsets(container: HTMLElement, range: Range) {
+    if (!container.contains(range.startContainer)) return null;
+    if (!container.contains(range.endContainer)) return null;
+
+    const getOffsetAt = (node: Node, offset: number) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        const walker = document.createTreeWalker(
+          container,
+          NodeFilter.SHOW_TEXT
+        );
+        let current = walker.nextNode();
+        let total = 0;
+
+        while (current) {
+          if (current === node) {
+            return total + Math.min(offset, current.textContent?.length ?? 0);
+          }
+          total += current.textContent?.length ?? 0;
+          current = walker.nextNode();
+        }
+
+        return null;
+      }
+
+      const boundary = document.createRange();
+      boundary.setStart(node, offset);
+      boundary.setEnd(node, offset);
+
+      const walker = document.createTreeWalker(
+        container,
+        NodeFilter.SHOW_TEXT
+      );
+      let current = walker.nextNode();
+      let total = 0;
+
+      while (current) {
+        const nodeRange = document.createRange();
+        nodeRange.selectNodeContents(current);
+
+        if (boundary.compareBoundaryPoints(Range.START_TO_END, nodeRange) > 0) {
+          total += current.textContent?.length ?? 0;
+          current = walker.nextNode();
+          continue;
+        }
+
+        return total;
+      }
+
+      return total;
+    };
+
+    const start = getOffsetAt(range.startContainer, range.startOffset);
+    const end = getOffsetAt(range.endContainer, range.endOffset);
+
+    if (start === null || end === null || end <= start) return null;
+    return { start, end };
+  }
+
 
   /* ---------------- Delete-annotation handler ---------------- */
-  async function deleteAnnotation(annotationId: number) {
+  async function deleteAnnotation(
+    annotationId: number,
+    panelId: "primary" | "secondary"
+  ) {
     const ok = confirm("Delete this highlight and its conversation?");
     if (!ok) return;
 
@@ -603,21 +918,18 @@ export default function Home() {
     setHighlights(prev =>
       prev.filter(h => h.annotation_id !== annotationId)
     );
-
-    setContext({
-      type: "text",
-      text: ctx.text,
-      page: ctx.page,
-    });
+    setChatHighlights(prev =>
+      prev.filter(h => h.annotation_id !== annotationId)
+    );
 
     // Exit annotation mode
-    setActiveAnnotationId(null);
-    setContext(null);
-
-    const docThread = chatThreads.find(t => t.annotation_id === null);
-    if (docThread) {
-      setActiveChatThreadId(docThread.id);
+    if (panelId === "secondary") {
+      setSecondaryActiveAnnotationId(null);
+    } else {
+      setActiveAnnotationId(null);
     }
+    setContext(null);
+    await backToFullConversation(panelId);
 
   }
 
@@ -648,13 +960,12 @@ export default function Home() {
 
       const sel = window.getSelection();
       if (!sel || sel.isCollapsed) {
-        popupModeRef.current = null;
-        hidePopup();
-        return;
-      }
+        // ignore collapse caused by mouseup right after selection
+        if (justOpenedPopupRef.current) {
+          return;
+        }
 
-      if (!sel || sel.isCollapsed) {
-        popupModeRef.current = null;
+        setPopupMode(null);
         hidePopup();
         return;
       }
@@ -666,14 +977,20 @@ export default function Home() {
       const rect = range.getBoundingClientRect();
       const container = range.commonAncestorContainer as HTMLElement;
 
-      const isChatSelection =
-        container.nodeType === Node.TEXT_NODE
-          ? container.parentElement?.closest("[data-chat-message]")
-          : container.closest?.("[data-chat-message]");
+      const rangeNode = range.commonAncestorContainer;
+
+      const messageEl =
+        rangeNode instanceof HTMLElement
+          ? rangeNode.closest("[data-chat-message]")
+          : rangeNode.parentElement?.closest("[data-chat-message]") ?? null;
+
+
+      const isChatSelection = Boolean(messageEl);
+
 
       // ---------------- CHAT TEXT ----------------
       if (isChatSelection) {
-        popupModeRef.current = "chat";
+        setPopupMode("chat");
 
         pendingTextRef.current = {
           type: "text",
@@ -681,10 +998,46 @@ export default function Home() {
           page: -1,
         };
 
+        const messageIndex = Number(
+          messageEl?.getAttribute("data-message-index")
+        );
+        const panelIdAttr = messageEl?.getAttribute("data-chat-panel-id");
+        const panelId: "primary" | "secondary" =
+          panelIdAttr === "secondary" ? "secondary" : "primary";
+        const rawMessageId = messageEl?.getAttribute("data-message-id");
+        if (!rawMessageId) {
+          return;
+        }
+        const messageId = Number(rawMessageId);
+
+        const panelMessages =
+          panelId === "secondary" ? secondaryVisibleMessages : visibleMessages;
+
+        if (Number.isNaN(messageIndex) || !panelMessages[messageIndex]) {
+          return;
+        }
+
+        if (Number.isNaN(messageId)) {
+          return;
+        }
+
+        const offsets = getSelectionOffsets(messageEl, range);
+        if (offsets) {
+          pendingChatHighlightRef.current = {
+            messageId,
+            start: offsets.start,
+            end: offsets.end,
+            panelId,
+          };
+        }
+
         pendingTextRectRef.current = rect;
         showPopup(rect);
+
+        // CRITICAL: stop processing permanently for this selection
         return;
       }
+
 
 
       // ---------------- PDF TEXT ----------------
@@ -692,7 +1045,13 @@ export default function Home() {
         "[data-page-number]"
       );
 
-      if (!pageEl) return;
+      if (!pageEl && !isChatSelection) {
+        // Not PDF, not chat → do nothing, but DO NOT override popup mode
+        hidePopup();
+        setPopupMode(null);
+
+        return;
+      }
 
       const pageNum = Number(pageEl.getAttribute("data-page-number"));
 
@@ -703,6 +1062,8 @@ export default function Home() {
       };
 
       pendingTextRectRef.current = rect;
+      setPopupMode("pdf");
+
       showPopup(rect);
     }
 
@@ -711,13 +1072,21 @@ export default function Home() {
     document.addEventListener("selectionchange", handleSelectionChange);
     return () =>
       document.removeEventListener("selectionchange", handleSelectionChange);
-  }, [regionMode]);
+  }, [regionMode, visibleMessages, secondaryVisibleMessages]);
 
   function showPopup(rect: DOMRect) {
     if (!popupRef.current) return;
+
+    justOpenedPopupRef.current = true;
+
     popupRef.current.style.display = "block";
     popupRef.current.style.top = `${rect.top + window.scrollY - 40}px`;
     popupRef.current.style.left = `${rect.left + window.scrollX}px`;
+
+    // allow collapse events AFTER this tick
+    setTimeout(() => {
+      justOpenedPopupRef.current = false;
+    }, 0);
   }
 
   function hidePopup() {
@@ -728,7 +1097,7 @@ export default function Home() {
   async function handlePopupConfirm() {
     isClickingPopupRef.current = true;
 
-    if (!pendingTextRef.current || !activeFileId) {
+    if (!pendingTextRef.current) {
       isClickingPopupRef.current = false;
       return;
     }
@@ -761,14 +1130,29 @@ export default function Home() {
       // CHAT TEXT (selection from chat)
       // ===============================
       if (ctx.page === -1) {
+        const highlight = pendingChatHighlightRef.current;
+        if (!highlight) {
+          cleanupPopup();
+          return;
+        }
+        const targetFileId =
+          highlight.panelId === "secondary" ? secondaryFileId : activeFileId;
+        if (!targetFileId) {
+          cleanupPopup();
+          return;
+        }
+
         const res = await fetch("http://localhost:8000/annotations", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            file_id: activeFileId,
+            file_id: targetFileId,
             page_number: -1,
             type: "chat_text",
             text: ctx.text,
+            message_id: highlight.messageId,
+            start: highlight.start,
+            end: highlight.end,
           }),
         });
 
@@ -778,15 +1162,36 @@ export default function Home() {
 
         const data = await res.json();
 
+        setChatHighlights(prev => [
+          ...prev,
+          {
+            annotation_id: data.annotation_id,
+            message_id: highlight.messageId,
+            start: highlight.start,
+            end: highlight.end,
+          },
+        ]);
+
+
         if (action === "new") {
-          const thread = await createNewChatThread(
-            activeFileId,
-            data.annotation_id
-          );
-          setActiveChatThreadId(thread.id);
-          setActiveAnnotationId(data.annotation_id);
+          const title = cleanChatTitle(ctx.text);
+          setSecondaryPanelOpen(true);
+          setSecondaryChatThreadId(null);
+          setSecondaryFileId(null);
+          setSecondaryFileTitle(null);
+          setSecondaryPendingTitle(title);
+          setSecondaryMessages([]);
+          setSecondaryVisibleMessages([]);
+          setSecondaryQuestion(`Explain "${ctx.text}"`);
+          setSecondaryActiveAnnotationId(data.annotation_id);
         } else {
-          setActiveAnnotationId(data.annotation_id);
+          if (highlight.panelId === "secondary") {
+            setSecondaryQuestion(`Explain "${ctx.text}"`);
+            setSecondaryActiveAnnotationId(data.annotation_id);
+          } else {
+            setQuestion(`Explain "${ctx.text}"`);
+            setActiveAnnotationId(data.annotation_id);
+          }
         }
 
         cleanupPopup();
@@ -867,7 +1272,7 @@ export default function Home() {
       } else {
         // Attach to document chat thread
         const docThread = chatThreads.find(
-          t => t.annotation_id === null
+          t => t.source_annotation_id === null
         );
 
         if (docThread) {
@@ -882,9 +1287,6 @@ export default function Home() {
       console.error(err);
       cleanupPopup();
     }
-    if (activeChatThreadId) {
-      await loadChatThreadMessages(activeChatThreadId);
-    }
   }
 
 
@@ -892,7 +1294,8 @@ export default function Home() {
   function cleanupPopup() {
     pendingTextRef.current = null;
     pendingTextRectRef.current = null;
-    popupModeRef.current = null;
+    pendingChatHighlightRef.current = null;
+    setPopupMode(null);
     pendingChatActionRef.current = "current";
     hidePopup();
     window.getSelection()?.removeAllRanges();
@@ -983,95 +1386,422 @@ export default function Home() {
 
   /* ---------------- Ask backend ---------------- */
 
-  async function askQuestion() {
-    if (!activeFileId) return;
+  async function askQuestion(panelId: "primary" | "secondary" = "primary") {
+    const isSecondary = panelId === "secondary";
+    let threadId = isSecondary ? secondaryChatThreadId : activeChatThreadId;
+    let createdFileId: number | null = null;
 
-    // fallback safety net
-    let threadId = activeChatThreadId;
-
-    if (!threadId) {
-      const docThread = chatThreads.find(t => t.annotation_id === null);
+    if (!isSecondary && !threadId) {
+      const docThread = chatThreads.find(t => t.source_annotation_id === null);
       if (!docThread) return;
       threadId = docThread.id;
       setActiveChatThreadId(threadId);
     }
 
+    if (isSecondary && !threadId) {
+      try {
+        const title = secondaryPendingTitle ?? "New Chat";
+        const data = await createStandaloneChat(title);
+        threadId = data.thread_id;
+        createdFileId = data.file_id;
+        setSecondaryChatThreadId(threadId);
+        setSecondaryFileId(data.file_id);
+        setSecondaryFileTitle(data.title ?? title);
+        setSecondaryPendingTitle(null);
+        setSecondaryPanelOpen(true);
+        setFiles(prev => [
+          {
+            id: data.file_id,
+            title: data.title ?? title,
+            folder_id: activeFileFolderId,
+          },
+          ...prev,
+        ]);
+      } catch (err) {
+        console.error(err);
+        return;
+      }
+    }
+
+    const currentQuestion = isSecondary ? secondaryQuestion : question;
+    const currentAnnotationId = isSecondary
+      ? secondaryActiveAnnotationId
+      : activeAnnotationId;
+
     const userMsg: ChatMsg = {
       role: "user",
-      content: question || "Explain this in simple terms.",
-      annotation_id: activeAnnotationId ?? undefined,
+      content: currentQuestion || "Explain this in simple terms.",
+      annotation_id: currentAnnotationId ?? undefined,
     };
 
+    const setMessages = isSecondary ? setSecondaryMessages : setAllMessages;
+    const setVisible = isSecondary
+      ? setSecondaryVisibleMessages
+      : setVisibleMessages;
+    const setQ = isSecondary ? setSecondaryQuestion : setQuestion;
+    const setLoad = isSecondary ? setSecondaryLoading : setLoading;
+
     setMessages(prev => [...prev, userMsg]);
-    setQuestion("");
-    setLoading(true);
+    setVisible(prev => [...prev, userMsg]);
+    setQ("");
+    setLoad(true);
+
+    const fileIdForPanel = isSecondary
+      ? secondaryFileId ?? createdFileId
+      : activeFileId;
+    if (!fileIdForPanel) {
+      setLoad(false);
+      return;
+    }
+
+    const body = fileIdForPanel
+      ? {
+          file_id: fileIdForPanel,
+          chat_thread_id: threadId,
+          annotation_id: currentAnnotationId,
+          question: userMsg.content,
+        }
+      : {
+          chat_thread_id: threadId,
+          annotation_id: currentAnnotationId,
+          question: userMsg.content,
+        };
 
     const res = await fetch("http://localhost:8000/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        file_id: activeFileId,
-        chat_thread_id: threadId,
-        annotation_id: activeAnnotationId,
-        question: userMsg.content,
-      }),
+      body: JSON.stringify(body),
     });
 
     const data = await res.json();
 
-    setMessages(prev => [
-      ...prev,
-      { role: "assistant", content: data.answer },
-    ]);
+    const assistantMsg: ChatMsg = {
+      id: data.assistant_message_id,
+      role: "assistant",
+      content: data.answer,
+      annotation_id: currentAnnotationId ?? undefined,
+    };
 
-    setLoading(false);
+    setMessages(prev => [...prev, assistantMsg]);
+
+    setVisible(prev =>
+      currentAnnotationId
+        ? assistantMsg.annotation_id === currentAnnotationId
+          ? [...prev, assistantMsg]
+          : prev
+        : [...prev, assistantMsg]
+    );
+
+    if (data.user_message_id) {
+      setMessages(prev =>
+        prev.map(msg =>
+          msg.role === "user" &&
+          msg.content === userMsg.content &&
+          msg.annotation_id === userMsg.annotation_id &&
+          msg.id === undefined
+            ? { ...msg, id: data.user_message_id }
+            : msg
+        )
+      );
+      setVisible(prev =>
+        prev.map(msg =>
+          msg.role === "user" &&
+          msg.content === userMsg.content &&
+          msg.annotation_id === userMsg.annotation_id &&
+          msg.id === undefined
+            ? { ...msg, id: data.user_message_id }
+            : msg
+        )
+      );
+    }
+
+    setLoad(false);
   }
 
 
-  async function loadChatThreadMessages(threadId: number) {
+  async function loadChatThreadMessages(
+    threadId: number,
+    panelId: "primary" | "secondary"
+  ) {
+    const versionAtCall = activeFileVersionRef.current;
+
     const res = await fetch(
       `http://localhost:8000/chat/thread/${threadId}`
     );
-
     if (!res.ok) return;
 
+    if (versionAtCall !== activeFileVersionRef.current) return;
+
     const data = await res.json();
-    setMessages(data.messages || []);
+    const messages = data.messages || [];
+    if (panelId === "secondary") {
+      setSecondaryMessages(messages);
+      setSecondaryVisibleMessages(messages);
+    } else {
+      setAllMessages(messages);
+      setVisibleMessages(messages);
+    }
+    return messages;
   }
 
 
+
   async function loadChatThreads(fileId: number) {
+    const versionAtCall = activeFileVersionRef.current;
+
     const res = await fetch(
       `http://localhost:8000/chat/threads?file_id=${fileId}`
     );
     if (!res.ok) return;
 
+    if (versionAtCall !== activeFileVersionRef.current) return;
+
     const data = await res.json();
-    let threads: ChatThread[] = data.threads || [];
+    const threads = data.threads || [];
 
-    // If no document thread exists, create one
-    let docThread = threads.find(t => t.annotation_id === null);
-
-    if (!docThread) {
-      const createRes = await fetch("http://localhost:8000/chat/threads", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ file_id: fileId }),
-      });
-
-      const created = await createRes.json();
-      docThread = { id: created.id, file_id: fileId, annotation_id: null, title: null };
-      threads = [...threads, docThread];
-    }
+    const docThread = threads.find(t => t.source_annotation_id === null);
+    if (!docThread) return;
 
     setChatThreads(threads);
     setActiveChatThreadId(docThread.id);
-
-    await loadChatThreadMessages(docThread.id);
   }
 
+  const showSecondaryChat = secondaryPanelOpen;
 
+  function renderChatPanel(panelId: "primary" | "secondary") {
+    const isSecondary = panelId === "secondary";
+    const panelTitle = isSecondary
+      ? secondaryFileTitle ?? secondaryPendingTitle ?? "New Chat"
+      : activeFileTitle ?? "Conversation";
+    const panelMessages = isSecondary ? secondaryVisibleMessages : visibleMessages;
+    const panelQuestion = isSecondary ? secondaryQuestion : question;
+    const panelLoading = isSecondary ? secondaryLoading : loading;
+    const panelActiveAnnotationId = isSecondary
+      ? secondaryActiveAnnotationId
+      : activeAnnotationId;
+    const panelThreadId = isSecondary
+      ? secondaryChatThreadId
+      : activeChatThreadId;
+    const setPanelQuestion = isSecondary ? setSecondaryQuestion : setQuestion;
+    const panelContainerRef = isSecondary
+      ? secondaryMessagesContainerRef
+      : messagesContainerRef;
 
+    return (
+      <div
+        key={panelId}
+        data-chat-panel-id={panelId}
+        style={{
+          flex: 1,
+          display: "flex",
+          flexDirection: "column",
+          height: "100%",
+          overflow: "hidden",
+          minWidth: 0,
+          borderLeft: isSecondary ? "1px solid #eee" : "none",
+          paddingLeft: isSecondary ? "1rem" : 0,
+        }}
+      >
+        {/* Header wrapper */}
+        <div
+          style={{
+            padding: "1rem",
+            borderBottom: "1px solid #eee",
+          }}
+        >
+          <h3
+            style={{
+              margin: 0,
+              display: "flex",
+              justifyContent: "space-between",
+              fontSize: "1.4rem",
+              alignItems: "center",
+            }}
+          >
+            <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              {pdfUrl === null && panelId === "primary" && (
+                <button
+                  onClick={() => setSidebarOpen(v => !v)}
+                  style={{
+                    background: "transparent",
+                    border: "none",
+                    padding: 0,
+                    cursor: "pointer",
+                    lineHeight: 0,
+                    color: "#666",
+                  }}
+                  aria-label={sidebarOpen ? "Close sidebar" : "Open sidebar"}
+                >
+                  <svg
+                    width="34"
+                    height="24"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    {sidebarOpen ? (
+                      <>
+                        <path d="M15 6l-6 6 6 6" />
+                        <path d="M19 6l-6 6 6 6" />
+                      </>
+                    ) : (
+                      <>
+                        <path d="M9 6l6 6-6 6" />
+                        <path d="M5 6l6 6-6 6" />
+                      </>
+                    )}
+                  </svg>
+                </button>
+              )}
+              {panelTitle}
+            </span>
+
+            <div style={{ display: "flex", gap: "12px", alignItems: "center" }}>
+              {panelActiveAnnotationId && (
+                <button
+                  onClick={() => backToFullConversation(panelId)}
+                  style={{
+                    background: "transparent",
+                    border: "none",
+                    color: "#555",
+                    cursor: "pointer",
+                    fontSize: "0.85rem",
+                  }}
+                >
+                  &larr; Back to full conversation
+                </button>
+              )}
+
+              {panelActiveAnnotationId && (
+                <button
+                  onClick={() =>
+                    deleteAnnotation(panelActiveAnnotationId, panelId)
+                  }
+                  style={{
+                    background: "transparent",
+                    border: "none",
+                    color: "#ff6b6b",
+                    cursor: "pointer",
+                    fontSize: "0.85rem",
+                  }}
+                >
+                  Delete highlight
+                </button>
+              )}
+            </div>
+          </h3>
+        </div>
+
+        {/* Messages */}
+        <div
+          ref={panelContainerRef}
+          style={{
+            flex: 1,
+            overflowY: "auto",
+            padding: "1rem",
+          }}
+        >
+          {panelMessages.map((m, i) => (
+            <div
+              key={`${m.role}-${m.id ?? i}-${m.annotation_id ?? "doc"}`}
+              ref={el => {
+                if (!m.id) return;
+                messageRefs.current[m.id] = el;
+              }}
+            >
+              <ChatMessage
+                role={m.role}
+                content={m.content}
+                messageId={m.id}
+                messageIndex={i}
+                panelId={panelId}
+                activeAnnotationId={panelActiveAnnotationId}
+                highlights={chatHighlights.filter(
+                  h => h.message_id === m.id
+                )}
+                onClick={
+                  m.role === "user" && m.annotation_id
+                    ? () => activateAnnotation(m.annotation_id, panelId)
+                    : undefined
+                }
+                onHighlightClick={(annotationId) => {
+                  activateAnnotation(annotationId, panelId);
+                }}
+              />
+            </div>
+          ))}
+        </div>
+
+        {/* Input */}
+        <div
+          style={{
+            padding: "1rem",
+            background: "transparent",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+          }}
+        >
+          <textarea
+            value={panelQuestion}
+            onChange={(e) => setPanelQuestion(e.target.value)}
+            style={{
+              width: "96%",
+              height: "80px",
+              borderRadius: UI_RADIUS,
+              border: "1px solid #ddd",
+              boxShadow: "0 4px 12px rgba(0,0,0,0.08)",
+              background: "#fff",
+              padding: "10px",
+              resize: "none",
+              outline: "none",
+            }}
+          />
+
+          <button
+            onClick={() => askQuestion(panelId)}
+            disabled={panelLoading || (!panelThreadId && !isSecondary)}
+            style={{
+              marginTop: "0.5rem",
+              width: "96%",
+              borderRadius: UI_RADIUS,
+              padding: "10px 0",
+              border: "1px solid #ddd",
+              boxShadow: "0 4px 12px rgba(0,0,0,0.08)",
+              background: "transparent",
+              cursor: "pointer",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            {panelLoading ? (
+              "Thinking..."
+            ) : (
+              <svg
+                width="18"
+                height="18"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M12 19V5" />
+                <path d="M5 12l7-7 7 7" />
+              </svg>
+            )}
+          </button>
+        </div>
+      </div>
+    );
+  }
 
 
   /* ---------------- UI ---------------- */
@@ -1086,12 +1816,17 @@ export default function Home() {
       {/* Sidebar */}
       <div
         style={{
-          width: sidebarOpen ? sidebarWidth : 0,
-          height: "100%",
+          width: sidebarOpen ? Math.max(180, sidebarWidth - 16) : 0,
+          height: sidebarOpen ? "calc(100% - 16px)" : "100%",
+          margin: sidebarOpen ? "8px 0 8px 8px" : "0",
           overflowY: "auto",
           overflowX: "hidden",
           transition: "width 0.2s ease",
-          borderRight: sidebarOpen ? `${DIVIDER_WIDTH} solid ${DIVIDER_COLOR}` : "none",
+          border: sidebarOpen ? "1px solid #ddd" : "none",
+          borderRadius: "12px",
+          boxShadow: sidebarOpen ? "0 4px 12px rgba(0,0,0,0.08)" : "none",
+          background: "#fff",
+          boxSizing: "border-box",
         }}
       >
         
@@ -1179,6 +1914,52 @@ export default function Home() {
               <FolderIcon />
               <span>Folder</span>
             </div>
+
+            <div
+              style={{ padding: "6px", cursor: "pointer" }}
+              onClick={async () => {
+                setAddMenuOpen(false);
+
+                activeFileVersionRef.current += 1;
+
+                const res = await fetch("http://localhost:8000/chat/standalone", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    folder_id: currentFolderId,
+                  }),
+                });
+
+                if (!res.ok) return;
+
+                const data = await res.json();
+
+                // Add to sidebar
+                setFiles(prev => [
+                  {
+                    id: data.file_id,
+                    title: data.title,
+                    folder_id: currentFolderId,
+                  },
+                  ...prev,
+                ]);
+
+                // Reset UI
+                setPdfUrl(null);
+                setNumPages(0);
+                setHighlights([]);
+                setContext(null);
+                setActiveAnnotationId(null);
+
+                // Activate chat file
+                setActiveFileId(data.file_id);
+              }}
+
+            >
+              <ChatIcon />
+              <span>Chat</span>
+            </div>
+
           </div>
         )}
 
@@ -1204,7 +1985,7 @@ export default function Home() {
                 folderHoldTimeoutRef.current = window.setTimeout(() => {
                   didTriggerHoldRef.current = true;
                   setFolderActionsOpenId(folder.id);
-                }, 2000); // ⏱ 2 seconds
+                }, 500); 
               }}
               onMouseUp={() => {
                 // Cancel hold timer
@@ -1354,11 +2135,18 @@ export default function Home() {
                 if (renamingFileId === file.id) return;
                 if (fileActionsOpenId === file.id) return;
 
-                  setActiveFileId(file.id);
+                // EXIT standalone chat mode
+                activeFileVersionRef.current += 1;
+
+                setPdfUrl(null);
+                setNumPages(0);
+                setHighlights([]);
                 setActiveAnnotationId(null);
                 setContext(null);
 
+                setActiveFileId(file.id);
               }}
+
               style={{
                 position: "relative",
                 padding: "8px",
@@ -1480,36 +2268,60 @@ export default function Home() {
           style={{
             width: DIVIDER_WIDTH,
             cursor: "col-resize",
-            background: DIVIDER_COLOR,
+            background: "transparent",
             userSelect: "none",
           }}
         />
       )}
 
-      {/* PDF Viewer */}
+    {pdfUrl !== null && (
       <div
         style={{
           width: `${100 - chatWidth}%`,
-          height: "100%",       
+          height: "100%",
           padding: "1rem",
-          overflow: "auto",      // scroll inside panel only
-          minHeight: 0,       
+          overflow: "auto",
+          minHeight: 0,
         }}
       >
+        {/* PDF Viewer */}
         <button
           onClick={() => setSidebarOpen(v => !v)}
           style={{
             marginBottom: "0.5rem",
-            fontSize: "1.2rem",
             background: "transparent",
             border: "none",
             padding: 0,
             cursor: "pointer",
+            lineHeight: 0,
+            color: "#666",
           }}
+          aria-label={sidebarOpen ? "Close sidebar" : "Open sidebar"}
         >
-          {sidebarOpen ? "<<" : ">>"}
+          <svg
+            width="34"
+            height="24"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            {sidebarOpen ? (
+              <>
+                <path d="M15 6l-6 6 6 6" />
+                <path d="M19 6l-6 6 6 6" />
+              </>
+            ) : (
+              <>
+                <path d="M9 6l6 6-6 6" />
+                <path d="M5 6l6 6-6 6" />
+              </>
+            )}
+          </svg>
         </button>
-
         <div
           ref={pdfContentRef}
           style={{ width: "100%" }}
@@ -1538,7 +2350,7 @@ export default function Home() {
 
 
         {pdfUrl && (
-          <Document file={pdfUrl} onLoadSuccess={({ numPages }) => setNumPages(numPages)}>
+          <Document key={activeFileId} file={pdfUrl} onLoadSuccess={({ numPages }) => setNumPages(numPages)}>
             {Array.from({ length: numPages }, (_, i) => {
               const pageNumber = i + 1;
               const pageHighlights = highlights.filter(h => h.page === pageNumber);
@@ -1556,7 +2368,10 @@ export default function Home() {
                   style={{
                     position: "relative",
                     marginBottom: "1.5rem",
-                    display: "inline-block", 
+                    display: "inline-block",
+                    boxShadow: "0 4px 10px rgba(0,0,0,0.06)",
+                    borderRadius: "8px",
+                    background: "#fff",
                   }}
                 >
                   {pdfContentWidth > 0 && (
@@ -1610,7 +2425,7 @@ export default function Home() {
                         key={`hit-${h.annotation_id}`}
                         onClick={(e) => {
                           e.stopPropagation();
-                          activateAnnotation(h.annotation_id);
+                          activateAnnotation(h.annotation_id, "primary");
                         }}
                         style={{
                           position: "absolute",
@@ -1686,6 +2501,7 @@ export default function Home() {
 
 
       </div>
+)}
 
       {/* Resize Handle */}
         <div
@@ -1698,117 +2514,26 @@ export default function Home() {
           }}
         />
 
-      {/* Chat Panel */}
+      {/* Chat Panels */}
       <div
+        data-chat-panels
         style={{
-          width: `${chatWidth}%`,
+          width: pdfUrl === null ? "100%" : `${chatWidth}%`,
           display: "flex",
-          flexDirection: "column",
+          flexDirection: "row",
           height: "100%",
           overflow: "hidden",
+          gap: showSecondaryChat ? "1rem" : 0,
         }}
       >
-        {/* Header wrapper */}
-        <div
-          style={{
-            padding: "1rem",
-            borderBottom: "1px solid #eee",
-          }}
-        >
-          <h3
-            style={{
-              margin: 0,
-              display: "flex",
-              justifyContent: "space-between",
-              fontSize: "1.4rem",
-              alignItems: "center",
-            }}
-          >
-            <span>{activeFileTitle ?? "Conversation"}</span>
-
-            {activeAnnotationId && (
-              <button
-                onClick={() => deleteAnnotation(activeAnnotationId)}
-                style={{
-                  background: "transparent",
-                  border: "none",
-                  color: "#ff6b6b",
-                  cursor: "pointer",
-                  fontSize: "0.85rem",
-                }}
-              >
-                Delete highlight
-              </button>
-            )}
-          </h3>
-        </div>
-
-        {/* Messages */}
-        <div
-          style={{
-            flex: 1,
-            overflowY: "auto",
-            padding: "1rem",
-          }}
-        >
-          {messages.map((m, i) => (
-            <ChatMessage
-              key={`${m.role}-${i}-${m.annotation_id ?? "doc"}`}
-              role={m.role}
-              content={m.content}
-              onClick={
-                m.role === "user" && m.annotation_id
-                  ? () => activateAnnotation(m.annotation_id)
-                  : undefined
-              }
-            />
-          ))}
-        </div>
-
-        {/* Input */}
-        <div
-          style={{
-            padding: "1rem",
-            background: "transparent",
-          }}
-        >
-          <textarea
-            value={question}
-            onChange={(e) => setQuestion(e.target.value)}
-            style={{
-              width: "95%",
-              height: "80px",
-              borderRadius: UI_RADIUS,
-              border: "1px solid #ccc",
-              padding: "10px",
-              resize: "none",
-              outline: "none",
-            }}
-          />
-
-          <button
-            onClick={askQuestion}
-            disabled={loading || !activeChatThreadId}
-            style={{
-              marginTop: "0.5rem",
-              width: "100%",
-              borderRadius: UI_RADIUS,
-              padding: "10px 0",
-              border: "1px solid #ccc",
-              background: "#fff",
-              cursor: "pointer",
-            }}
-          >
-            {loading ? "Thinking..." : "Ask"}
-          </button>
-        </div>
+        {renderChatPanel("primary")}
+        {showSecondaryChat && renderChatPanel("secondary")}
       </div>
       {!regionMode && (
           <div
             ref={popupRef}
             style={{
               position: "absolute",
-              display: "none",
               background: "#111",
               color: "#fff",
               padding: "6px",
@@ -1819,7 +2544,7 @@ export default function Home() {
               gap: "6px",
             }}
           >
-            {popupModeRef.current === "chat" ? (
+            {popupMode === "chat" && (
               <>
                 <span
                   style={{ cursor: "pointer", padding: "4px 6px" }}
@@ -1845,12 +2570,14 @@ export default function Home() {
                   New chat
                 </span>
               </>
-            ) : (
+            )}
+
+            {popupMode === "pdf" && (
               <span
                 style={{ cursor: "pointer", padding: "4px 6px" }}
                 onMouseDown={(e) => {
                   e.preventDefault();
-                  handlePopupConfirm(); // PDF → Add to chat
+                  handlePopupConfirm();
                 }}
               >
                 Add to chat

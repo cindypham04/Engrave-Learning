@@ -15,6 +15,32 @@ conn.execute("PRAGMA foreign_keys = ON")
 def get_cursor():
     return conn.cursor()
 
+def cleanup_math_blocks(text: str) -> str:
+    if not text:
+        return text
+
+    while "$$\n$$" in text:
+        text = text.replace("$$\n$$", "$$")
+
+    lines = text.split("\n")
+    cleaned = []
+    i = 0
+    while i < len(lines):
+        if (
+            lines[i].strip() == "$$"
+            and i + 2 < len(lines)
+            and lines[i + 2].strip() == "$$"
+            and "$" in lines[i + 1]
+        ):
+            cleaned.append(lines[i + 1])
+            i += 3
+            continue
+
+        cleaned.append(lines[i])
+        i += 1
+
+    return "\n".join(cleaned)
+
 
 # ======================================================
 # Pages
@@ -73,7 +99,7 @@ def init_messages():
     cur.execute("""
     CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        document_id TEXT NOT NULL,
+        document_id TEXT,
         role TEXT NOT NULL,
         content TEXT NOT NULL,
         annotation_id INTEGER,
@@ -104,7 +130,7 @@ def get_messages(document_id):
     cur = get_cursor()
     cur.execute(
         """
-        SELECT role, content, annotation_id, reference
+        SELECT id, role, content, annotation_id, reference
         FROM messages
         WHERE document_id = ?
         ORDER BY created_at ASC
@@ -113,10 +139,11 @@ def get_messages(document_id):
     )
     return [
         {
-            "role": r[0],
-            "content": r[1],
-            "annotation_id": r[2],
-            "reference": json.loads(r[3]) if r[3] else None,
+            "id": r[0],
+            "role": r[1],
+            "content": cleanup_math_blocks(r[2]),
+            "annotation_id": r[3],
+            "reference": json.loads(r[4]) if r[4] else None,
         }
         for r in cur.fetchall()
     ]
@@ -126,7 +153,7 @@ def get_messages_by_annotation(annotation_id):
     cur = get_cursor()
     cur.execute(
         """
-        SELECT role, content, annotation_id
+        SELECT id, role, content, annotation_id
         FROM messages
         WHERE annotation_id = ?
         ORDER BY created_at ASC
@@ -134,7 +161,12 @@ def get_messages_by_annotation(annotation_id):
         (annotation_id,)
     )
     return [
-        {"role": r[0], "content": r[1], "annotation_id": r[2]}
+        {
+            "id": r[0],
+            "role": r[1],
+            "content": cleanup_math_blocks(r[2]),
+            "annotation_id": r[3],
+        }
         for r in cur.fetchall()
     ]
 
@@ -433,14 +465,41 @@ def delete_file_cascade(file_id: int):
     if not document_id:
         raise Exception("File not found")
 
-    # delete annotations
-    cur.execute("DELETE FROM annotations WHERE document_id = ?", (document_id,))
+    # 1. Delete messages
+    cur.execute(
+        "DELETE FROM messages WHERE document_id = ?",
+        (document_id,)
+    )
 
-    # delete messages
-    cur.execute("DELETE FROM messages WHERE document_id = ?", (document_id,))
+    # 2. Delete chat threads (IMPORTANT)
+    cur.execute(
+        "DELETE FROM chat_threads WHERE file_id = ?",
+        (file_id,)
+    )
 
-    # delete file row
-    cur.execute("DELETE FROM files WHERE id = ?", (file_id,))
+    # 3. Delete chat highlights
+    cur.execute(
+        """
+        DELETE FROM chat_highlights
+        WHERE annotation_id IN (
+            SELECT id FROM annotations WHERE document_id = ?
+        )
+        """,
+        (document_id,),
+    )
+
+    # 4. Delete annotations
+    cur.execute(
+        "DELETE FROM annotations WHERE document_id = ?",
+        (document_id,)
+    )
+
+    # 5. Delete file
+    cur.execute(
+        "DELETE FROM files WHERE id = ?",
+        (file_id,)
+    )
+
 
 def delete_annotation(annotation_id: int):
     cur = get_cursor()
@@ -464,6 +523,12 @@ def delete_annotation(annotation_id: int):
     cur.execute(
         "DELETE FROM messages WHERE annotation_id = ?",
         (annotation_id,)
+    )
+
+    # Delete chat highlight entries
+    cur.execute(
+        "DELETE FROM chat_highlights WHERE annotation_id = ?",
+        (annotation_id,),
     )
 
     # Delete annotation itself
@@ -579,12 +644,13 @@ def save_message_to_thread(
             json.dumps(reference) if reference else None,
         ),
     )
+    return cur.lastrowid
 
 def get_messages_by_thread(chat_thread_id: int):
     cur = get_cursor()
     cur.execute(
         """
-        SELECT role, content, annotation_id, reference
+        SELECT id, role, content, annotation_id, reference
         FROM messages
         WHERE chat_thread_id = ?
         ORDER BY created_at ASC
@@ -593,10 +659,72 @@ def get_messages_by_thread(chat_thread_id: int):
     )
     return [
         {
-            "role": r[0],
-            "content": r[1],
-            "annotation_id": r[2],
-            "reference": json.loads(r[3]) if r[3] else None,
+            "id": r[0],
+            "role": r[1],
+            "content": cleanup_math_blocks(r[2]),
+            "annotation_id": r[3],
+            "reference": json.loads(r[4]) if r[4] else None,
+        }
+        for r in cur.fetchall()
+    ]
+
+
+# ======================================================
+# Chat highlights
+# ======================================================
+
+def init_chat_highlights():
+    cur = get_cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat_highlights (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            annotation_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            start INTEGER NOT NULL,
+            end INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (annotation_id) REFERENCES annotations(id),
+            FOREIGN KEY (message_id) REFERENCES messages(id)
+        )
+        """
+    )
+
+
+def save_chat_highlight(
+    annotation_id: int,
+    message_id: int,
+    start: int,
+    end: int,
+):
+    cur = get_cursor()
+    cur.execute(
+        """
+        INSERT INTO chat_highlights (annotation_id, message_id, start, end)
+        VALUES (?, ?, ?, ?)
+        """,
+        (annotation_id, message_id, start, end),
+    )
+
+
+def get_chat_highlights_by_document(document_id: str):
+    cur = get_cursor()
+    cur.execute(
+        """
+        SELECT ch.annotation_id, ch.message_id, ch.start, ch.end
+        FROM chat_highlights ch
+        JOIN annotations a ON a.id = ch.annotation_id
+        WHERE a.document_id = ?
+        ORDER BY ch.created_at ASC
+        """,
+        (document_id,),
+    )
+    return [
+        {
+            "annotation_id": r[0],
+            "message_id": r[1],
+            "start": r[2],
+            "end": r[3],
         }
         for r in cur.fetchall()
     ]
@@ -653,6 +781,103 @@ def migrate_create_chat_threads_from_existing_data():
             (thread_id, msg_id),
         )
 
+def get_child_folders(folder_id: int):
+    cur = get_cursor()
+    cur.execute(
+        "SELECT id FROM folders WHERE parent_id = ?",
+        (folder_id,)
+    )
+    return [r[0] for r in cur.fetchall()]
+
+def get_files_in_folder(folder_id: int):
+    cur = get_cursor()
+    cur.execute(
+        "SELECT id FROM files WHERE folder_id = ?",
+        (folder_id,)
+    )
+    return [r[0] for r in cur.fetchall()]
+
+def delete_folder_cascade(folder_id: int):
+    cur = get_cursor()
+
+    # 1. Delete files in this folder
+    file_ids = get_files_in_folder(folder_id)
+    for file_id in file_ids:
+        delete_file_cascade(file_id)
+
+    # 2. Delete child folders (recursive)
+    child_folders = get_child_folders(folder_id)
+    for child_id in child_folders:
+        delete_folder_cascade(child_id)
+
+    # 3. Delete the folder itself
+    cur.execute(
+        "DELETE FROM folders WHERE id = ?",
+        (folder_id,)
+    )
+
+def get_next_chat_title(user_id: int) -> str:
+    cur = get_cursor()
+    cur.execute(
+        """
+        SELECT COUNT(*)
+        FROM files
+        WHERE user_id = ? AND s3_key IS NULL
+        """,
+        (user_id,),
+    )
+    count = cur.fetchone()[0]
+    return f"Chat_{count + 1}"
+
+# Create standalone chat file + thread
+def create_standalone_chat(
+    user_id: int,
+    folder_id: Optional[int] = None,
+    title: Optional[str] = None,
+):
+    """
+    Creates:
+    - a file entry representing the chat
+    - a document-level chat thread
+    Returns file + thread info
+    """
+
+    if not title:
+        title = get_next_chat_title(user_id)
+
+    # Use a synthetic document_id for chats
+    document_id = f"chat_{os.urandom(6).hex()}"
+
+    cur = get_cursor()
+
+    # 1. Create file (chat)
+    cur.execute(
+        """
+        INSERT INTO files (folder_id, document_id, title, user_id)
+        VALUES (?, ?, ?, ?)
+        """,
+        (folder_id, document_id, title, user_id),
+    )
+    file_id = cur.lastrowid
+
+    # 2. Create document-level chat thread
+    cur.execute(
+        """
+        INSERT INTO chat_threads (file_id, source_annotation_id, title)
+        VALUES (?, NULL, ?)
+        """,
+        (file_id, title),
+    )
+    thread_id = cur.lastrowid
+
+    return {
+        "file_id": file_id,
+        "document_id": document_id,
+        "thread_id": thread_id,
+        "title": title,
+    }
+
+
 # ======================================================
 # Init everything ONCE
 # ======================================================
@@ -665,6 +890,7 @@ init_folders()
 init_files()
 migrate_add_chat_thread_id_to_messages()
 init_chat_threads()
+init_chat_highlights()
 
 def rollback():
     conn.rollback()

@@ -33,6 +33,10 @@ from db import (
     get_chat_threads_by_file,
     get_messages_by_thread,
     create_chat_thread,
+    delete_folder_cascade,
+    create_standalone_chat,
+    save_chat_highlight,
+    get_chat_highlights_by_document,
 )
 
 
@@ -91,6 +95,7 @@ def normalize_math(text: str) -> str:
     lines = text.split("\n")
     normalized = []
     buffer = []
+    in_display_block = False
 
     def flush_buffer():
         if buffer:
@@ -99,12 +104,20 @@ def normalize_math(text: str) -> str:
             buffer.clear()
 
     def looks_like_equation(line: str) -> bool:
-        # Must contain "="
-        if "=" not in line:
-            return False
-
         # Exclude bullets, headings, or list items
         if line.lstrip().startswith(("-", "*", "•", "#")):
+            return False
+
+        # If the line already contains inline math, don't auto-wrap it.
+        if "$" in line:
+            return False
+
+        # Treat obvious LaTeX commands as math even without "=".
+        if re.search(r"\\[a-zA-Z]+", line):
+            return True
+
+        # Must contain "=" for plain-text equations.
+        if "=" not in line:
             return False
 
         # Exclude sentences with punctuation typical of prose
@@ -116,10 +129,42 @@ def normalize_math(text: str) -> str:
     for line in lines:
         stripped = line.strip()
 
+        if "$$" in stripped:
+            flush_buffer()
+
+            if stripped.startswith("$$") and stripped.endswith("$$") and stripped != "$$":
+                normalized.append(line)
+                continue
+
+            normalized.append(line)
+            in_display_block = not in_display_block
+            continue
+
+        if in_display_block:
+            normalized.append(line)
+            continue
+
         # Already valid LaTeX math
         if stripped.startswith("$$") or stripped.startswith("$"):
             flush_buffer()
             normalized.append(line)
+            continue
+
+        bullet_match = re.match(r"^(\s*[-*•]\s+)(.+)$", line)
+        if bullet_match:
+            prefix = bullet_match.group(1)
+            content = bullet_match.group(2).strip()
+        else:
+            prefix = ""
+            content = stripped
+
+        if content and "$" not in content and re.search(r"\\[a-zA-Z]+", content):
+            flush_buffer()
+            wrapper = "$$" if len(content) > 60 else "$"
+            if wrapper == "$$":
+                normalized.append(f"{prefix}{wrapper}\n{content}\n{wrapper}")
+            else:
+                normalized.append(f"{prefix}{wrapper}{content}{wrapper}")
             continue
 
         # Equation line
@@ -274,48 +319,79 @@ Your success is measured by whether the student could re-explain the idea in the
 """
 
 # Case 1: user asked about a text - call OpenAI 
-def ask_openai(prompt_text, system_prompt=system_prompt):
+def ask_openai(prompt_text, system_prompt=system_prompt, history=None):
+    input_messages = [
+        {"role": "system", "content": system_prompt},
+    ]
+
+    if history:
+        input_messages.extend(history)
+
+    input_messages.append({"role": "user", "content": prompt_text})
+
     response = client.responses.create(
         model="gpt-4.1-mini",
-        input=[
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": prompt_text
-            }
-        ],
+        input=input_messages,
         temperature=0.3
     )
     return response.output_text
 
 # Case 2: user asked about a region - call OpenAI 
-def ask_region(prompt_text: str, region_s3_key: str, system_prompt=system_prompt):
+def ask_region(
+    prompt_text: str,
+    region_s3_key: str,
+    system_prompt=system_prompt,
+    history=None,
+):
     # 1. Generate temporary S3 URL
     image_url = generate_presigned_url(region_s3_key)
 
     # 2. Send URL directly to OpenAI
+    input_messages = [
+        {"role": "system", "content": system_prompt},
+    ]
+
+    if history:
+        input_messages.extend(history)
+
+    input_messages.append(
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": prompt_text},
+                {
+                    "type": "input_image",
+                    "image_url": image_url,
+                },
+            ],
+        }
+    )
+
     response = client.responses.create(
         model="gpt-4.1-mini",
-        input=[
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt_text},
-                    {
-                        "type": "input_image",
-                        "image_url": image_url,
-                    },
-                ],
-            },
-        ],
+        input=input_messages,
         temperature=0.3,
     )
 
     return response.output_text
+
+
+def build_thread_history(
+    chat_thread_id: int,
+    exclude_message_id: Optional[int] = None,
+    max_messages: int = 20,
+):
+    messages = get_messages_by_thread(chat_thread_id)
+    if exclude_message_id is not None:
+        messages = [m for m in messages if m.get("id") != exclude_message_id]
+
+    if max_messages > 0:
+        messages = messages[-max_messages:]
+
+    return [
+        {"role": m["role"], "content": m["content"]}
+        for m in messages
+    ]
 
 # Store annotation object
 class CreateAnnotation(BaseModel):
@@ -324,11 +400,14 @@ class CreateAnnotation(BaseModel):
     type: Literal["text", "region", "chat_text"]
     geometry: Optional[dict] = None
     text: Optional[str] = None
+    message_id: Optional[int] = None
+    start: Optional[int] = None
+    end: Optional[int] = None
 
 # Store Ask Question objects
 class AskQuestion(BaseModel):
-    file_id: int
-    chat_thread_id: int 
+    file_id: Optional[int] = None
+    chat_thread_id: int
     annotation_id: Optional[int] = None
     question: str
 
@@ -346,8 +425,12 @@ class CreateFolderRequest(BaseModel):
     parent_id: Optional[int] = None
 
 class CreateChatThread(BaseModel):
-    file_id: int
+    file_id: Optional[int] = None
     source_annotation_id: Optional[int] = None
+    title: Optional[str] = None
+
+class CreateStandaloneChatRequest(BaseModel):
+    folder_id: Optional[int] = None
     title: Optional[str] = None
 
 
@@ -367,6 +450,13 @@ async def upload_file(file: UploadFile = File(...), folder_id: Optional[int] = F
             title=title,
             user_id=user_id,
         )
+
+        create_chat_thread(
+            file_id=file_id,
+            source_annotation_id=None,
+            title=title or "Document chat",
+        )
+
 
         pages = extract_pages_from_pdf_from_bytes(pdf_bytes, document_id)
         save_pages(pages)
@@ -399,13 +489,32 @@ def create_text_annotation(payload: CreateAnnotation):
 
     # Chat-text annotations (LLM response selection)
     if payload.type == "chat_text":
+        if payload.message_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="message_id is required for chat_text annotations",
+            )
+
+        if payload.start is None or payload.end is None:
+            raise HTTPException(
+                status_code=400,
+                detail="start/end are required for chat_text annotations",
+            )
+
         annotation_id = create_annotation(
             document_id=document_id,
-            page_number=0,          
+            page_number=-1,          
             type="chat_text",
             geometry=None,
             text=payload.text,
         )
+        save_chat_highlight(
+            annotation_id=annotation_id,
+            message_id=payload.message_id,
+            start=payload.start,
+            end=payload.end,
+        )
+        commit()
         return {"annotation_id": annotation_id}
 
     # PDF text / region annotations
@@ -416,6 +525,7 @@ def create_text_annotation(payload: CreateAnnotation):
         geometry=payload.geometry,
         text=payload.text,
     )
+    commit()
     return {"annotation_id": annotation_id}
 
 
@@ -430,35 +540,73 @@ def get_file_metadata(file_id: int):
 
 @app.get("/files/{file_id}/state")
 def get_file_state(file_id: int):
-    # 1. Get file metadata
     file = get_file(file_id)
     if not file:
         raise HTTPException(status_code=404, detail="File not found")
 
     document_id = file["document_id"]
 
-    # 2. Load document-scoped data
-    messages = get_messages(document_id)
-    annotations = get_annotations_by_document(document_id)
+    # Load chat threads
+    threads = get_chat_threads_by_file(file_id)
+    if not threads:
+        raise HTTPException(
+            status_code=500,
+            detail="No chat threads found for file"
+        )
 
-    # 3. Build PDF URL from S3
+    # Pick document-level thread as default
+    doc_thread = next(
+        (t for t in threads if t["source_annotation_id"] is None),
+        None
+    )
+    if not doc_thread:
+        raise HTTPException(
+            status_code=500,
+            detail="Document-level chat thread missing"
+        )
+
+    # CHAT FILE (no PDF)
     if not file["s3_key"]:
-        raise HTTPException(status_code=500, detail="File missing s3_key")
+        messages = get_messages_by_thread(doc_thread["id"])
+        chat_highlights = get_chat_highlights_by_document(document_id)
 
+        return {
+            "type": "chat",
+            "file": {
+                "id": file["id"],
+                "title": file["title"],
+                "folder_id": file["folder_id"],
+            },
+            "pdf_url": None,
+            "threads": threads,
+            "active_thread_id": doc_thread["id"],
+            "annotations": [],
+            "chat_highlights": chat_highlights,
+            "messages": messages,
+        }
+
+    # PDF FILE
     pdf_url = generate_presigned_url(file["s3_key"])
+    annotations = get_annotations_by_document(document_id)
+    chat_highlights = get_chat_highlights_by_document(document_id)
 
+    messages = get_messages_by_thread(doc_thread["id"])
 
-    # 4. Return unified state
     return {
+        "type": "pdf",
         "file": {
             "id": file["id"],
             "title": file["title"],
             "folder_id": file["folder_id"],
         },
         "pdf_url": pdf_url,
-        "messages": messages,
+        "threads": threads,
+        "active_thread_id": doc_thread["id"],
         "annotations": annotations,
+        "chat_highlights": chat_highlights,
+        "messages": messages,  
     }
+
 
 
 # Get the image region from frontend
@@ -524,26 +672,73 @@ def upload_region_endpoint(
 # Get question from frontend
 @app.post("/ask")
 def ask_document(req: AskQuestion):
+    # --------------------------------------------------
+    # 0. Basic validation
+    # --------------------------------------------------
+    if req.file_id is None:
+        raise HTTPException(status_code=400, detail="file_id is required")
 
-    # Example of pages = [{"page_number": ..., "text": ...}]
+    if req.chat_thread_id is None:
+        raise HTTPException(status_code=400, detail="chat_thread_id is required")
+
+    file = get_file(req.file_id)
+    if not file:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # ==================================================
+    # 1. STANDALONE CHAT (NO PDF)
+    # ==================================================
+    if file["s3_key"] is None:
+        document_id = get_document_id_by_file(req.file_id)
+        if not document_id:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        # Save user message
+        user_message_id = save_message_to_thread(
+            chat_thread_id=req.chat_thread_id,
+            document_id=document_id,
+            role="user",
+            content=req.question,
+            annotation_id=req.annotation_id,
+        )
+
+        history = build_thread_history(
+            req.chat_thread_id,
+            exclude_message_id=user_message_id,
+        )
+
+        # Ask LLM directly
+        answer = ask_openai(req.question, history=history)
+        answer = normalize_math(answer)
+
+        # Save assistant message
+        assistant_message_id = save_message_to_thread(
+            chat_thread_id=req.chat_thread_id,
+            document_id=document_id,
+            role="assistant",
+            content=answer,
+            annotation_id=req.annotation_id,
+        )
+
+        return {
+            "answer": answer,
+            "user_message_id": user_message_id,
+            "assistant_message_id": assistant_message_id,
+        }
+
+    # ==================================================
+    # 2. PDF-BACKED CHAT
+    # ==================================================
     document_id = get_document_id_by_file(req.file_id)
     if not document_id:
-        raise HTTPException(status_code=404, detail="File not found")
-    
-    if req.chat_thread_id is None:
-        raise HTTPException(
-            status_code=400,
-            detail="chat_thread_id is required"
-        )
+        raise HTTPException(status_code=404, detail="Document not found")
 
     pages = get_pages(document_id)
 
-
-    if not pages:
-        return {"answer": "Document not found."}
-    
-    # Save user message first
-    save_message_to_thread(
+    # --------------------------------------------------
+    # Save user message (always)
+    # --------------------------------------------------
+    user_message_id = save_message_to_thread(
         chat_thread_id=req.chat_thread_id,
         document_id=document_id,
         role="user",
@@ -551,18 +746,58 @@ def ask_document(req: AskQuestion):
         annotation_id=req.annotation_id,
     )
 
-    # ---------- Annotation-based mode ----------
+    history = build_thread_history(
+        req.chat_thread_id,
+        exclude_message_id=user_message_id,
+    )
+
+    # --------------------------------------------------
+    # 3. ANNOTATION-BASED QUESTION
+    # --------------------------------------------------
     if req.annotation_id:
         annotation = get_annotation(req.annotation_id)
         if not annotation:
             raise HTTPException(status_code=404, detail="Annotation not found")
 
-        selected_text = annotation.get("text")
-
         if annotation["document_id"] != document_id:
             raise HTTPException(status_code=400, detail="Annotation mismatch")
 
-        page_idx = annotation["page_number"] - 1
+        # ---------- CHAT TEXT ANNOTATION ----------
+        if annotation["type"] == "chat_text":
+            prompt = f"""
+The student selected the following text from a previous explanation:
+
+\"\"\"{annotation["text"]}\"\"\"
+
+Question:
+{req.question}
+"""
+            answer = ask_openai(prompt_text=prompt, history=history)
+            answer = normalize_math(answer)
+
+            assistant_message_id = save_message_to_thread(
+                chat_thread_id=req.chat_thread_id,
+                document_id=document_id,
+                role="assistant",
+                content=answer,
+                annotation_id=req.annotation_id,
+            )
+
+            return {
+                "answer": answer,
+                "user_message_id": user_message_id,
+                "assistant_message_id": assistant_message_id,
+            }
+
+        # ---------- PDF TEXT / REGION ANNOTATION ----------
+        page_number = annotation["page_number"]
+        if page_number <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid page number for PDF annotation",
+            )
+
+        page_idx = page_number - 1
 
         prev_text = pages[page_idx - 1]["text"] if page_idx - 1 >= 0 else ""
         curr_text = pages[page_idx]["text"]
@@ -571,11 +806,11 @@ def ask_document(req: AskQuestion):
         prompt = f"""
 The student selected the following exact text from the document:
 
-\"\"\"{selected_text}\"\"\"
+\"\"\"{annotation.get("text", "")}\"\"\"
 
-This text appears on page {annotation['page_number']}.
+This text appears on page {page_number}.
 
-Here is surrounding context from the document (for reference only):
+Here is surrounding context (for reference only):
 
 --- Previous context ---
 {prev_text}
@@ -587,7 +822,6 @@ Here is surrounding context from the document (for reference only):
 {next_text}
 
 Answer the question by focusing primarily on the selected text.
-Only use the surrounding context if needed for clarification.
 
 Question:
 {req.question}
@@ -595,18 +829,22 @@ Question:
 
         if annotation["type"] == "region":
             if not annotation.get("region_s3_key"):
-                raise HTTPException(status_code=500, detail="Region missing S3 key")
+                raise HTTPException(
+                    status_code=500,
+                    detail="Region missing S3 key",
+                )
 
             answer = ask_region(
                 prompt_text=prompt,
                 region_s3_key=annotation["region_s3_key"],
+                history=history,
             )
         else:
-            answer = ask_openai(prompt_text=prompt)
+            answer = ask_openai(prompt_text=prompt, history=history)
 
         answer = normalize_math(answer)
 
-        save_message_to_thread(
+        assistant_message_id = save_message_to_thread(
             chat_thread_id=req.chat_thread_id,
             document_id=document_id,
             role="assistant",
@@ -614,41 +852,45 @@ Question:
             annotation_id=req.annotation_id,
         )
 
+        return {
+            "answer": answer,
+            "user_message_id": user_message_id,
+            "assistant_message_id": assistant_message_id,
+        }
 
-        return {"answer": answer}
+    # --------------------------------------------------
+    # 4. DOCUMENT-LEVEL QUESTION (NO ANNOTATION)
+    # --------------------------------------------------
+    if not pages:
+        return {"answer": "Document not found."}
 
-    # ---------- Document-level fallback ----------
     prompt = f"""
-    Answer the following question using the document below.
+Answer the following question using the document below.
 
-    {reshape_pages(pages)}
+{reshape_pages(pages)}
 
-    Question:
-    {req.question}
-    """
+Question:
+{req.question}
+"""
 
-    answer = ask_openai(prompt_text=prompt)
+    answer = ask_openai(prompt_text=prompt, history=history)
     answer = normalize_math(answer)
 
-    save_message_to_thread(
-    chat_thread_id=req.chat_thread_id,
-    document_id=document_id,
-    role="assistant",
-    content=answer,
-    annotation_id=req.annotation_id,
-)
+    assistant_message_id = save_message_to_thread(
+        chat_thread_id=req.chat_thread_id,
+        document_id=document_id,
+        role="assistant",
+        content=answer,
+        annotation_id=None,
+    )
+
+    return {
+        "answer": answer,
+        "user_message_id": user_message_id,
+        "assistant_message_id": assistant_message_id,
+    }
 
 
-    return {"answer": answer}
-
-
-@app.get("/chat/file/{file_id}")
-def get_chat(file_id: int):
-    document_id = get_document_id_by_file(file_id)
-    if not document_id:
-        raise HTTPException(status_code=404, detail="File not found")
-
-    return {"messages": get_messages(document_id)}
 
 
 @app.get("/chat/annotation/{annotation_id}")
@@ -679,7 +921,9 @@ def get_document_annotations(file_id: int):
 
 @app.get("/files")
 def get_files():
-    return {"files": list_files(user_id=1)}
+    return {
+        "files": list_files(user_id=1)
+    }
 
 @app.patch("/files/{file_id}/rename")
 def rename_file_endpoint(file_id: int, payload: RenameFileRequest):
@@ -736,7 +980,30 @@ def list_folders_endpoint(
 
 @app.get("/chat/threads")
 def get_threads(file_id: int):
-    return {"threads": get_chat_threads_by_file(file_id)}
+    threads = get_chat_threads_by_file(file_id)
+
+    # Ensure document-level thread exists
+    doc_thread = next(
+        (t for t in threads if t["source_annotation_id"] is None),
+        None
+    )
+
+    if not doc_thread:
+        file = get_file(file_id)
+        if not file:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        thread_id = create_chat_thread(
+            file_id=file_id,
+            source_annotation_id=None,
+            title=file["title"] or "Document chat",
+        )
+        commit()
+
+        threads = get_chat_threads_by_file(file_id)
+
+    return {"threads": threads}
+
 
 @app.get("/chat/thread/{thread_id}")
 def get_thread_messages(thread_id: int):
@@ -752,6 +1019,16 @@ def create_thread(payload: CreateChatThread):
     commit()
     return {"id": thread_id}
 
+@app.delete("/folders/{folder_id}")
+def delete_folder(folder_id: int):
+    try:
+        delete_folder_cascade(folder_id)
+        commit()
+        return {"ok": True}
+    except Exception as e:
+        rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    
 
 # Debug route 
 @app.get("/debug/page_count")
@@ -774,6 +1051,25 @@ def create_folder_endpoint(payload: CreateFolderRequest):
         "name": payload.name,
         "parent_id": payload.parent_id,
     }
+
+@app.post("/chat/standalone")
+def create_standalone_chat_endpoint(
+    payload: Optional[CreateStandaloneChatRequest] = None,
+):
+    user_id = 1  # later from auth
+
+    if payload is None:
+        payload = CreateStandaloneChatRequest()
+
+    result = create_standalone_chat(
+        user_id=user_id,
+        folder_id=payload.folder_id,
+        title=payload.title,
+    )
+
+    commit()
+    return result
+
 
 
 # Debug route - load OpenAI
