@@ -9,7 +9,10 @@ An AI tutoring app that lets users upload PDFs, ask questions, and store chats/a
 - S3-backed storage for PDFs and region images.
 
 ## Demo
-<video src="IMG_9737%202.MP4" controls muted playsinline></video>
+- Video: https://youtu.be/jSPLiHsQnW8
+- Screenshots:
+  - ![Screenshot 1](Screenshot%202026-01-21%20at%209.09.57%E2%80%AFPM.png)
+  - ![Screenshot 2](Screenshot%202026-01-21%20at%209.09.34%E2%80%AFPM.png)
 
 ## Tech stack
 - Backend: FastAPI, SQLite, PyMuPDF, OpenAI SDK, boto3
