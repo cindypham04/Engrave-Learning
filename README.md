@@ -8,6 +8,9 @@ An AI tutoring app that lets users upload PDFs, ask questions, and store chats/a
 - Chat threads per file or annotation, powered by OpenAI.
 - S3-backed storage for PDFs and region images.
 
+## Demo
+<video src="IMG_9737%202.MP4" controls muted playsinline></video>
+
 ## Tech stack
 - Backend: FastAPI, SQLite, PyMuPDF, OpenAI SDK, boto3
 - Frontend: Next.js (React), Tailwind, react-pdf, KaTeX
