@@ -1,10 +1,10 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+// Main UI state and handlers for sidebar, chat panels, and PDF viewer.
+import { Fragment, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import "react-pdf/dist/Page/TextLayer.css";
 import "react-pdf/dist/Page/AnnotationLayer.css";
-import { start } from "repl";
 
 const ChatMessage = dynamic(
   () => import("../../components/ChatMessage"),
@@ -25,6 +25,7 @@ const Document = dynamic(
 const Page = dynamic(
   async () => {
     const mod = await import("react-pdf");
+    mod.pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
     return mod.Page;
   },
   { ssr: false }
@@ -95,6 +96,8 @@ export default function Home() {
   
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
   const [numPages, setNumPages] = useState(0);
+  const [pdfReady, setPdfReady] = useState(false);
+  const [pdfLoadedUrl, setPdfLoadedUrl] = useState<string | null>(null);
 
   const [context, setContext] = useState<Context | null>(null);
 
@@ -117,6 +120,14 @@ export default function Home() {
   const [secondaryFileId, setSecondaryFileId] = useState<number | null>(null);
   const [secondaryFileTitle, setSecondaryFileTitle] = useState<string | null>(null);
   const [secondaryPendingTitle, setSecondaryPendingTitle] = useState<string | null>(null);
+  const [hoveredPanelId, setHoveredPanelId] = useState<"primary" | "secondary" | null>(null);
+  const [hoveredFileId, setHoveredFileId] = useState<number | null>(null);
+  const [hoveredFolderId, setHoveredFolderId] = useState<number | null>(null);
+  const [hoveredSendPanelId, setHoveredSendPanelId] = useState<"primary" | "secondary" | null>(null);
+  const [hoveredChatDivider, setHoveredChatDivider] = useState(false);
+  const [collapsedFileIds, setCollapsedFileIds] = useState<Set<number>>(new Set());
+  const [pendingDeleteAnnotationId, setPendingDeleteAnnotationId] = useState<number | null>(null);
+  const [pendingDeletePanelId, setPendingDeletePanelId] = useState<"primary" | "secondary" | null>(null);
 
   const popupRef = useRef<HTMLDivElement | null>(null);
   const pendingTextRef = useRef<TextContext | null>(null);
@@ -162,10 +173,10 @@ export default function Home() {
   const [activeFileTitle, setActiveFileTitle] = useState<string | null>(null);
 
   // PDF scaler state
-  const [pdfScale, setPdfScale] = useState(1.2);
+  const [pdfScale] = useState(1.0);
 
   // Chat width state
-  const [chatWidth, setChatWidth] = useState(32); // percent
+  const [chatWidth, setChatWidth] = useState(40); // percent
   const [isResizing, setIsResizing] = useState(false);
 
   // Rename state
@@ -193,11 +204,19 @@ export default function Home() {
   // Adjust sidebar width state
   const [sidebarWidth, setSidebarWidth] = useState(240);
   const [isResizingSidebar, setIsResizingSidebar] = useState(false);
+  const [hasUserResizedSidebar, setHasUserResizedSidebar] = useState(false);
+  const MIN_SIDEBAR_WIDTH = 180;
+  const MAX_SIDEBAR_WIDTH = 420;
 
   const PDF_INSET = 0.95;
 
   const folderHoldTimeoutRef = useRef<number | null>(null);
   const didTriggerHoldRef = useRef(false);
+  const fileHoldTimeoutRef = useRef<number | null>(null);
+  const didTriggerFileHoldRef = useRef(false);
+  const pdfHighlightHoldTimerRef = useRef<number | null>(null);
+  const pdfHighlightHoldFiredRef = useRef(false);
+  const suppressPdfHighlightClickRef = useRef(false);
 
   // Diviver of panels
   const DIVIDER_COLOR = "#000";
@@ -207,6 +226,7 @@ export default function Home() {
   const UI_RADIUS = 12;
 
   const pdfContentRef = useRef<HTMLDivElement | null>(null);
+  const pdfScrollRef = useRef<HTMLDivElement | null>(null);
   const [pdfContentWidth, setPdfContentWidth] = useState(0);
 
   // User select current or new chat in the selected text in the chat
@@ -221,6 +241,11 @@ export default function Home() {
 
   // LLM response highlight state
   const [chatHighlights, setChatHighlights] = useState<ChatHighlight[]>([]);
+  const [pendingDeleteAnchor, setPendingDeleteAnchor] = useState<{
+    panelId: "primary" | "secondary";
+    top: number;
+    left: number;
+  } | null>(null);
 
   // track “just showed popup”
   const justOpenedPopupRef = useRef(false);
@@ -303,6 +328,21 @@ export default function Home() {
     return () => window.removeEventListener("click", handleClick);
   }, []);
 
+  useEffect(() => {
+    function handleHoverClear(e: MouseEvent) {
+      const target = e.target as HTMLElement;
+      if (target.closest(".file-row") || target.closest("[data-folder-row]")) {
+        return;
+      }
+
+      setHoveredFileId(null);
+      setHoveredFolderId(null);
+    }
+
+    window.addEventListener("mousemove", handleHoverClear);
+    return () => window.removeEventListener("mousemove", handleHoverClear);
+  }, []);
+
   // Mouse listener
   useEffect(() => {
     function handleMouseMove(e: MouseEvent) {
@@ -311,11 +351,14 @@ export default function Home() {
       const newWidth = e.clientX;
 
       // Clamp so it stays usable
-      const clamped = Math.min(400, Math.max(160, newWidth));
+      const clamped = Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, newWidth));
       setSidebarWidth(clamped);
     }
 
     function handleMouseUp() {
+      if (isResizingSidebar) {
+        setHasUserResizedSidebar(true);
+      }
       setIsResizingSidebar(false);
     }
 
@@ -350,6 +393,40 @@ export default function Home() {
     if (!pdfUrl) {
       setPopupMode(null);
       hidePopup();
+      setPdfReady(false);
+      setPdfLoadedUrl(null);
+    }
+  }, [pdfUrl]);
+
+  useEffect(() => {
+    import("react-pdf").then(mod => {
+      mod.pdfjs.GlobalWorkerOptions.workerSrc =
+        "https://unpkg.com/pdfjs-dist@5.4.449/build/pdf.worker.min.js";
+    });
+  }, []);
+
+  useEffect(() => {
+    const originalWarn = console.warn;
+    console.warn = (...args: any[]) => {
+      if (
+        typeof args[0] === "string" &&
+        args[0].includes("AbortException: TextLayer task cancelled")
+      ) {
+        return;
+      }
+      originalWarn(...args);
+    };
+
+    return () => {
+      console.warn = originalWarn;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!pdfUrl) {
+      setPdfReady(false);
+      setNumPages(0);
+      setPdfLoadedUrl(null);
     }
   }, [pdfUrl]);
 
@@ -358,10 +435,26 @@ export default function Home() {
   /* ---------------- Helpers ---------------- */
 
   function scrollToPage(page: number) {
+    // Scroll within the PDF panel without shifting the overall layout.
     const el = pageRefs.current[page];
     if (!el) return;
 
-    el.scrollIntoView({ behavior: "smooth", block: "start" });
+    const container = pdfScrollRef.current;
+    if (!container) {
+      el.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+
+    const containerRect = container.getBoundingClientRect();
+    const elementRect = el.getBoundingClientRect();
+    const inView =
+      elementRect.top >= containerRect.top + 8 &&
+      elementRect.bottom <= containerRect.bottom - 8;
+
+    if (inView) return;
+
+    const offsetTop = el.offsetTop - 8;
+    container.scrollTo({ top: offsetTop, behavior: "smooth" });
   }
 
   function getContextLabel(ctx: Context) {
@@ -378,6 +471,59 @@ export default function Home() {
     return cleaned.length > 48 ? `${cleaned.slice(0, 48)}...` : cleaned;
   }
 
+  function truncateSidebarTitle(title: string) {
+    const words = title.trim().split(/\s+/).filter(Boolean);
+    if (words.length <= 4) return title;
+    return `${words.slice(0, 4).join(" ")}...`;
+  }
+
+  async function setTitleFromSelection() {
+    if (!pendingTextRef.current) return;
+
+    const rawText = pendingTextRef.current.text;
+    const title = cleanChatTitle(rawText);
+
+    let targetFileId: number | null = null;
+    if (popupMode === "chat") {
+      const highlight = pendingChatHighlightRef.current;
+      if (!highlight) return;
+      targetFileId =
+        highlight.panelId === "secondary" ? secondaryFileId : activeFileId;
+    } else if (popupMode === "pdf") {
+      targetFileId = activeFileId;
+    }
+
+    if (!targetFileId) return;
+
+    const res = await fetch(
+      `http://localhost:8000/files/${targetFileId}/rename`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title }),
+      }
+    );
+
+    if (!res.ok) {
+      alert("Failed to rename file");
+      return;
+    }
+
+    setFiles(prev =>
+      prev.map(f => (f.id === targetFileId ? { ...f, title } : f))
+    );
+
+    if (targetFileId === activeFileId) {
+      setActiveFileTitle(title);
+    }
+    if (targetFileId === secondaryFileId) {
+      setSecondaryFileTitle(title);
+      setSecondaryPendingTitle(null);
+    }
+
+    cleanupPopup();
+  }
+
   async function createStandaloneChat(title: string) {
     const res = await fetch("http://localhost:8000/chat/standalone", {
       method: "POST",
@@ -385,6 +531,7 @@ export default function Home() {
       body: JSON.stringify({
         folder_id: activeFileFolderId,
         title,
+        source_annotation_id: secondaryActiveAnnotationId,
       }),
     });
 
@@ -393,6 +540,19 @@ export default function Home() {
     }
 
     return res.json();
+  }
+
+  async function fetchThreadByAnnotation(annotationId: number) {
+    const res = await fetch(
+      `http://localhost:8000/chat/thread/by-annotation/${annotationId}`
+    );
+
+    if (!res.ok) {
+      return null;
+    }
+
+    const data = await res.json();
+    return data?.thread ?? null;
   }
 
   async function fetchAnnotation(annotationId: number) {
@@ -414,6 +574,9 @@ export default function Home() {
     } else {
       setActiveAnnotationId(null);
     }
+    setPendingDeleteAnnotationId(null);
+    setPendingDeletePanelId(null);
+    setPendingDeleteAnchor(null);
 
     const threadId = isSecondary ? secondaryChatThreadId : activeChatThreadId;
     if (!threadId) return;
@@ -437,6 +600,27 @@ export default function Home() {
       }, 0);
     }
   }
+
+  useEffect(() => {
+    function handleGlobalClick(event: MouseEvent) {
+      const target = event.target as HTMLElement | null;
+      if (!target) return;
+
+      if (
+        target.closest("[data-annotation-id]") ||
+        target.closest("[data-delete-annotation]")
+      ) {
+        return;
+      }
+
+      setPendingDeleteAnnotationId(null);
+      setPendingDeletePanelId(null);
+      setPendingDeleteAnchor(null);
+    }
+
+    document.addEventListener("click", handleGlobalClick);
+    return () => document.removeEventListener("click", handleGlobalClick);
+  }, []);
 
 
   async function loadFileState(fileId: number) {
@@ -538,6 +722,7 @@ export default function Home() {
         id: data.file_id,
         title: data.title,
         folder_id: currentFolderId,
+        s3_key: "pdf",
       },
       ...prev,
     ]);
@@ -588,7 +773,7 @@ export default function Home() {
     );
   }
 
-  function ChatIcon({ size = 14 }: { size?: number }) {
+  function ChatIcon({ size = 16 }: { size?: number }) {
     return (
       <svg
         width={size}
@@ -596,12 +781,13 @@ export default function Home() {
         viewBox="0 0 24 24"
         fill="none"
         stroke="currentColor"
-        strokeWidth="1.6"
+        strokeWidth="1.8"
         strokeLinecap="round"
         strokeLinejoin="round"
-        style={{ marginRight: 6, opacity: 0.7 }}
+        style={{ marginRight: 6, opacity: 0.7, position: "relative", top: "1px" }}
       >
-        <path d="M21 15a4 4 0 0 1-4 4H7l-4 4V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z" />
+        <rect x="3" y="4" width="18" height="12" rx="5" ry="5" />
+        <path d="M9 16l-4 4v-4" />
       </svg>
     );
   }
@@ -670,8 +856,27 @@ export default function Home() {
     annotationId: number,
     panelId: "primary" | "secondary"
   ) {
+    // Open the related chat thread and focus the PDF page if needed.
+    setPendingDeleteAnnotationId(null);
+    setPendingDeletePanelId(null);
+    setPendingDeleteAnchor(null);
     const annotation = await fetchAnnotation(annotationId);
     if (!annotation) return;
+
+    if (panelId === "primary") {
+      const linked = await fetchThreadByAnnotation(annotationId);
+      if (linked) {
+        setSecondaryPanelOpen(true);
+        setSecondaryChatThreadId(linked.id);
+        setSecondaryFileId(linked.file_id);
+        setSecondaryFileTitle(linked.file_title ?? linked.title ?? "New Chat");
+        setSecondaryPendingTitle(null);
+        setSecondaryActiveAnnotationId(annotationId);
+        setSecondaryQuestion("");
+        await loadChatThreadMessages(linked.id, "secondary");
+        return;
+      }
+    }
 
     const isSecondary = panelId === "secondary";
     const containerRef = isSecondary
@@ -723,6 +928,18 @@ export default function Home() {
     if (annotation.page_number > 0) {
       scrollToPage(annotation.page_number);
     }
+  }
+
+  function closeSecondaryPanel() {
+    setSecondaryPanelOpen(false);
+    setSecondaryChatThreadId(null);
+    setSecondaryFileId(null);
+    setSecondaryFileTitle(null);
+    setSecondaryPendingTitle(null);
+    setSecondaryMessages([]);
+    setSecondaryVisibleMessages([]);
+    setSecondaryQuestion("");
+    setSecondaryActiveAnnotationId(null);
   }
 
 
@@ -914,6 +1131,12 @@ export default function Home() {
       return;
     }
 
+    fetch("http://localhost:8000/files")
+      .then(res => res.json())
+      .then(data =>
+        setFiles(Array.isArray(data) ? data : data.files ?? [])
+      );
+
     // Remove highlight from PDF
     setHighlights(prev =>
       prev.filter(h => h.annotation_id !== annotationId)
@@ -928,9 +1151,30 @@ export default function Home() {
     } else {
       setActiveAnnotationId(null);
     }
+    setPendingDeleteAnnotationId(null);
+    setPendingDeletePanelId(null);
+    setPendingDeleteAnchor(null);
     setContext(null);
     await backToFullConversation(panelId);
 
+  }
+
+  function setDeleteAnchorFromRect(
+    rect: DOMRect,
+    panelId: "primary" | "secondary"
+  ) {
+    const container = panelId === "secondary"
+      ? secondaryMessagesContainerRef.current
+      : messagesContainerRef.current;
+    if (!container) {
+      setPendingDeleteAnchor(null);
+      return;
+    }
+
+    const containerRect = container.getBoundingClientRect();
+    const top = rect.top - containerRect.top + container.scrollTop;
+    const left = rect.right - containerRect.left + container.scrollLeft;
+    setPendingDeleteAnchor({ panelId, top, left });
   }
 
   const visibleFolders = folders.filter(f =>
@@ -944,10 +1188,326 @@ export default function Home() {
       ? f.folder_id === null
       : f.folder_id === currentFolderId
   );
+  const visibleFileIds = new Set(visibleFiles.map(f => f.id));
+  const fileChildrenMap = new Map<number, typeof visibleFiles>();
+  visibleFiles.forEach(f => {
+    if (f.parent_file_id && visibleFileIds.has(f.parent_file_id)) {
+      const list = fileChildrenMap.get(f.parent_file_id) ?? [];
+      list.push(f);
+      fileChildrenMap.set(f.parent_file_id, list);
+    }
+  });
+  const rootFiles = visibleFiles.filter(
+    f => !f.parent_file_id || !visibleFileIds.has(f.parent_file_id)
+  );
+
+  useEffect(() => {
+    if (hasUserResizedSidebar || !sidebarOpen) return;
+
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const bodyStyle = getComputedStyle(document.body);
+    const font = `${bodyStyle.fontWeight} ${bodyStyle.fontSize} ${bodyStyle.fontFamily}`;
+    ctx.font = font;
+
+    const baseRowPadding = 64; // icon + padding
+    let maxWidth = 0;
+
+    const headerText = currentFolderName ?? "Home";
+    maxWidth = Math.max(
+      maxWidth,
+      ctx.measureText(headerText).width + 80
+    );
+
+    visibleFolders.forEach(folder => {
+      const width = ctx.measureText(folder.name).width + baseRowPadding;
+      if (width > maxWidth) maxWidth = width;
+    });
+
+    const fileById = new Map(visibleFiles.map(f => [f.id, f]));
+    const depthMemo = new Map<number, number>();
+    const getDepth = (file: any): number => {
+      if (depthMemo.has(file.id)) return depthMemo.get(file.id) as number;
+      const parentId = file.parent_file_id;
+      if (!parentId || !fileById.has(parentId)) {
+        depthMemo.set(file.id, 0);
+        return 0;
+      }
+      const depth = getDepth(fileById.get(parentId)) + 1;
+      depthMemo.set(file.id, depth);
+      return depth;
+    };
+
+    visibleFiles.forEach(file => {
+      const depth = getDepth(file);
+      const displayTitle = truncateSidebarTitle(file.title);
+      const width =
+        ctx.measureText(displayTitle).width +
+        baseRowPadding +
+        depth * 16 +
+        (depth > 0 ? 12 : 0);
+      if (width > maxWidth) maxWidth = width;
+    });
+
+    const nextWidth = Math.min(
+      MAX_SIDEBAR_WIDTH,
+      Math.max(MIN_SIDEBAR_WIDTH, Math.ceil(maxWidth + 8))
+    );
+    setSidebarWidth(nextWidth);
+  }, [
+    currentFolderName,
+    visibleFiles,
+    visibleFolders,
+    sidebarOpen,
+    hasUserResizedSidebar,
+  ]);
 
   const currentFolder = currentFolderId
     ? folders.find(f => f.id === currentFolderId)
     : null;
+
+  // Render a sidebar file row with optional child toggle.
+  const renderFileRow = (file: any, depth: number) => (
+    <div
+      className="file-row"
+      key={file.id}
+      onMouseEnter={() => setHoveredFileId(file.id)}
+      onMouseDown={() => {
+        if (fileActionsOpenId === file.id) return;
+
+        didTriggerFileHoldRef.current = false;
+
+        fileHoldTimeoutRef.current = window.setTimeout(() => {
+          didTriggerFileHoldRef.current = true;
+          setFileActionsOpenId(prev =>
+            prev === file.id ? null : file.id
+          );
+        }, 400);
+      }}
+      onMouseUp={() => {
+        if (fileHoldTimeoutRef.current) {
+          clearTimeout(fileHoldTimeoutRef.current);
+          fileHoldTimeoutRef.current = null;
+        }
+
+        if (didTriggerFileHoldRef.current) return;
+
+        if (renamingFileId === file.id) return;
+        if (fileActionsOpenId === file.id) return;
+
+        // EXIT standalone chat mode
+        activeFileVersionRef.current += 1;
+
+        setPdfUrl(null);
+        setNumPages(0);
+        setHighlights([]);
+        setActiveAnnotationId(null);
+        setContext(null);
+
+        setActiveFileId(file.id);
+      }}
+      onMouseLeave={() => {
+        setHoveredFileId(prev => (prev === file.id ? null : prev));
+        if (fileHoldTimeoutRef.current) {
+          clearTimeout(fileHoldTimeoutRef.current);
+          fileHoldTimeoutRef.current = null;
+        }
+      }}
+      style={{
+        position: "relative",
+        padding: "8px",
+        paddingLeft: `${8 + depth * 16}px`,
+        cursor: "pointer",
+        background:
+          file.id === activeFileId
+            ? "#CBB9A4"
+            : hoveredFileId === file.id
+              ? "#eee6ddff"
+              : "transparent",
+      }}
+    >
+      {renamingFileId === file.id ? (
+        <input
+          autoFocus
+          value={renameValue}
+          onChange={e => setRenameValue(e.target.value)}
+          onBlur={async () => {
+            await renameFile(file.id, renameValue);
+            setRenamingFileId(null);
+          }}
+          onKeyDown={async e => {
+            if (e.key === "Enter") {
+              await renameFile(file.id, renameValue);
+              setRenamingFileId(null);
+            }
+            if (e.key === "Escape") {
+              setRenamingFileId(null);
+            }
+          }}
+        />
+      ) : (
+        <div style={{ display: "flex", justifyContent: "space-between" }}>
+          <span style={{ display: "flex", alignItems: "center" }}>
+            {depth > 0 && (
+              <span
+                style={{
+                  width: "12px",
+                  height: "12px",
+                  marginRight: "6px",
+                  borderLeft: "2px solid #c4c4c4",
+                  borderBottom: "2px solid #c4c4c4",
+                  borderBottomLeftRadius: "6px",
+                }}
+              />
+            )}
+            {file.s3_key ? <FileIcon /> : <ChatIcon />}
+            <span
+              style={{
+                color: "#442913",
+                whiteSpace: "nowrap",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+              }}
+            >
+              {truncateSidebarTitle(file.title)}
+            </span>
+          </span>
+
+          {fileChildrenMap.get(file.id)?.length ? (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                setCollapsedFileIds(prev => {
+                  const next = new Set(prev);
+                  if (next.has(file.id)) {
+                    next.delete(file.id);
+                  } else {
+                    next.add(file.id);
+                  }
+                  return next;
+                });
+              }}
+              style={{
+                background: "transparent",
+                border: "none",
+                padding: 0,
+                marginLeft: "8px",
+                cursor: "pointer",
+                color: "#A48D78",
+                lineHeight: 0,
+              }}
+              aria-label="Toggle child chats"
+            >
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 16 16"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                {collapsedFileIds.has(file.id) ? (
+                  <path d="M4 6l4 4 4-4" />
+                ) : (
+                  <path d="M4 10l4-4 4 4" />
+                )}
+              </svg>
+            </button>
+          ) : (
+            <span style={{ width: "14px" }} />
+          )}
+          {fileActionsOpenId === file.id && (
+            <div
+              onClick={e => e.stopPropagation()}
+              style={{
+                position: "absolute",
+                right: "8px",
+                top: "50%",
+                transform: "translateY(-50%)",
+                display: "flex",
+                alignItems: "center",
+                background: "#fff",
+                borderRadius: "8px",
+                padding: "6px 8px",
+                boxShadow: "0 4px 12px rgba(0,0,0,0.08)",
+                fontSize: "0.85rem",
+                zIndex: 50,
+              }}
+            >
+              {/* Rename */}
+              <span
+                style={{
+                  padding: "2px 6px",
+                  cursor: "pointer",
+                  borderRadius: "4px",
+                }}
+                onClick={() => {
+                  setRenamingFileId(file.id);
+                  setRenameValue(file.title);
+                  setFileActionsOpenId(null);
+                }}
+                onMouseEnter={e =>
+                  (e.currentTarget.style.background = "#f5f5f5")
+                }
+                onMouseLeave={e =>
+                  (e.currentTarget.style.background = "transparent")
+                }
+              >
+                Rename
+              </span>
+
+              {/* Divider */}
+              <div
+                style={{
+                  width: "1px",
+                  height: "90%",
+                  background: "#ddd",
+                  margin: "0 6px",
+                }}
+              />
+
+              {/* Delete */}
+              <span
+                style={{
+                  padding: "2px 6px",
+                  cursor: "pointer",
+                  color: "#e53935",
+                  borderRadius: "4px",
+                }}
+                onClick={() => {
+                  deleteFile(file.id);
+                  setFileActionsOpenId(null);
+                }}
+                onMouseEnter={e =>
+                  (e.currentTarget.style.background = "#fdecea")
+                }
+                onMouseLeave={e =>
+                  (e.currentTarget.style.background = "transparent")
+                }
+              >
+                Delete
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+
+  const renderFileTree = (file: any, depth: number) => (
+    <Fragment key={`file-tree-${file.id}`}>
+      {renderFileRow(file, depth)}
+      {!collapsedFileIds.has(file.id) &&
+        (fileChildrenMap.get(file.id) ?? []).map(child =>
+          renderFileTree(child, depth + 1)
+        )}
+    </Fragment>
+  );
 
 
   /* ---------------- Text selection ---------------- */
@@ -1268,6 +1828,7 @@ export default function Home() {
           text: ctx.text,
           page: ctx.page,
         });
+        setQuestion(`Explain "${ctx.text}"`);
 
       } else {
         // Attach to document chat thread
@@ -1280,6 +1841,7 @@ export default function Home() {
         }
 
         setActiveAnnotationId(data.annotation_id);
+        setQuestion(`Explain "${ctx.text}"`);
       }
 
       cleanupPopup();
@@ -1299,6 +1861,10 @@ export default function Home() {
     pendingChatActionRef.current = "current";
     hidePopup();
     window.getSelection()?.removeAllRanges();
+
+    if (popupMode === "pdf") {
+      setContext(null);
+    }
 
     setTimeout(() => {
       isClickingPopupRef.current = false;
@@ -1414,6 +1980,8 @@ export default function Home() {
             id: data.file_id,
             title: data.title ?? title,
             folder_id: activeFileFolderId,
+            parent_file_id: activeFileId ?? null,
+            s3_key: null,
           },
           ...prev,
         ]);
@@ -1444,6 +2012,9 @@ export default function Home() {
     setMessages(prev => [...prev, userMsg]);
     setVisible(prev => [...prev, userMsg]);
     setQ("");
+    if (panelId === "primary") {
+      setContext(null);
+    }
     setLoad(true);
 
     const fileIdForPanel = isSecondary
@@ -1569,10 +2140,11 @@ export default function Home() {
   const showSecondaryChat = secondaryPanelOpen;
 
   function renderChatPanel(panelId: "primary" | "secondary") {
+    // Shared chat panel renderer for primary and secondary views.
     const isSecondary = panelId === "secondary";
     const panelTitle = isSecondary
       ? secondaryFileTitle ?? secondaryPendingTitle ?? "New Chat"
-      : activeFileTitle ?? "Conversation";
+      : activeFileTitle ?? "Engrave";
     const panelMessages = isSecondary ? secondaryVisibleMessages : visibleMessages;
     const panelQuestion = isSecondary ? secondaryQuestion : question;
     const panelLoading = isSecondary ? secondaryLoading : loading;
@@ -1591,6 +2163,8 @@ export default function Home() {
       <div
         key={panelId}
         data-chat-panel-id={panelId}
+        onMouseEnter={() => setHoveredPanelId(panelId)}
+        onMouseLeave={() => setHoveredPanelId(prev => (prev === panelId ? null : prev))}
         style={{
           flex: 1,
           display: "flex",
@@ -1618,7 +2192,14 @@ export default function Home() {
               alignItems: "center",
             }}
           >
-            <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <span
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "8px",
+                color: "#442913",
+              }}
+            >
               {pdfUrl === null && panelId === "primary" && (
                 <button
                   onClick={() => setSidebarOpen(v => !v)}
@@ -1628,7 +2209,7 @@ export default function Home() {
                     padding: 0,
                     cursor: "pointer",
                     lineHeight: 0,
-                    color: "#666",
+                    color: "#A48D78",
                   }}
                   aria-label={sidebarOpen ? "Close sidebar" : "Open sidebar"}
                 >
@@ -1644,15 +2225,9 @@ export default function Home() {
                     aria-hidden="true"
                   >
                     {sidebarOpen ? (
-                      <>
-                        <path d="M15 6l-6 6 6 6" />
-                        <path d="M19 6l-6 6 6 6" />
-                      </>
+                      <path d="M15 6l-6 6 6 6" />
                     ) : (
-                      <>
-                        <path d="M9 6l6 6-6 6" />
-                        <path d="M5 6l6 6-6 6" />
-                      </>
+                      <path d="M9 6l6 6-6 6" />
                     )}
                   </svg>
                 </button>
@@ -1675,21 +2250,37 @@ export default function Home() {
                   &larr; Back to full conversation
                 </button>
               )}
-
-              {panelActiveAnnotationId && (
+              {hoveredPanelId === panelId && (
                 <button
-                  onClick={() =>
-                    deleteAnnotation(panelActiveAnnotationId, panelId)
-                  }
+                  onClick={() => {
+                    if (panelId === "secondary") {
+                      closeSecondaryPanel();
+                      return;
+                    }
+
+                    if (showSecondaryChat) {
+                      closeSecondaryPanel();
+                    }
+                  }}
                   style={{
                     background: "transparent",
                     border: "none",
-                    color: "#ff6b6b",
+                    color: "#A48D78",
                     cursor: "pointer",
-                    fontSize: "0.85rem",
+                    padding: "4px",
+                    lineHeight: 1,
                   }}
+                  aria-label="Close chat panel"
                 >
-                  Delete highlight
+                  <span
+                    style={{
+                      display: "inline-block",
+                      width: "12px",
+                      height: "2px",
+                      background: "currentColor",
+                      borderRadius: "999px",
+                    }}
+                  />
                 </button>
               )}
             </div>
@@ -1703,6 +2294,7 @@ export default function Home() {
             flex: 1,
             overflowY: "auto",
             padding: "1rem",
+            position: "relative",
           }}
         >
           {panelMessages.map((m, i) => (
@@ -1713,27 +2305,65 @@ export default function Home() {
                 messageRefs.current[m.id] = el;
               }}
             >
-              <ChatMessage
-                role={m.role}
-                content={m.content}
-                messageId={m.id}
-                messageIndex={i}
-                panelId={panelId}
-                activeAnnotationId={panelActiveAnnotationId}
-                highlights={chatHighlights.filter(
-                  h => h.message_id === m.id
-                )}
-                onClick={
-                  m.role === "user" && m.annotation_id
-                    ? () => activateAnnotation(m.annotation_id, panelId)
-                    : undefined
-                }
-                onHighlightClick={(annotationId) => {
-                  activateAnnotation(annotationId, panelId);
-                }}
-              />
+                <ChatMessage
+                  role={m.role}
+                  content={m.content}
+                  messageId={m.id}
+                  messageIndex={i}
+                  panelId={panelId}
+                  activeAnnotationId={panelActiveAnnotationId}
+                  highlights={chatHighlights.filter(
+                    h => h.message_id === m.id
+                  )}
+                  onClick={
+                    m.role === "user" && m.annotation_id
+                      ? () => activateAnnotation(m.annotation_id, panelId)
+                      : undefined
+                  }
+                  onHighlightClick={(annotationId) => {
+                    activateAnnotation(annotationId, panelId);
+                  }}
+                  onHighlightHold={(annotationId, rect) => {
+                    setPendingDeleteAnnotationId(annotationId);
+                    setPendingDeletePanelId(panelId);
+                    setDeleteAnchorFromRect(rect, panelId);
+                  }}
+                />
             </div>
           ))}
+
+          {pendingDeleteAnnotationId &&
+            pendingDeletePanelId === panelId &&
+            pendingDeleteAnchor?.panelId === panelId && (
+              <button
+                onClick={() =>
+                  deleteAnnotation(pendingDeleteAnnotationId, panelId)
+                }
+                data-delete-annotation
+                style={{
+                  position: "absolute",
+                  top: Math.max(0, pendingDeleteAnchor.top - 12),
+                  left: Math.max(0, pendingDeleteAnchor.left + 6),
+                  background: "#fff",
+                  border: "1px solid #ddd",
+                  borderRadius: "999px",
+                  color: "#ff6b6b",
+                  cursor: "pointer",
+                  fontSize: "0.8rem",
+                  fontWeight: 700,
+                  lineHeight: 1,
+                  width: "20px",
+                  height: "20px",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  boxShadow: "0 4px 10px rgba(0,0,0,0.08)",
+                }}
+                aria-label="Delete highlight"
+              >
+                x
+              </button>
+            )}
         </div>
 
         {/* Input */}
@@ -1742,62 +2372,84 @@ export default function Home() {
             padding: "1rem",
             background: "transparent",
             display: "flex",
-            flexDirection: "column",
-            alignItems: "center",
           }}
         >
-          <textarea
-            value={panelQuestion}
-            onChange={(e) => setPanelQuestion(e.target.value)}
+          <div
             style={{
-              width: "96%",
-              height: "80px",
-              borderRadius: UI_RADIUS,
-              border: "1px solid #ddd",
-              boxShadow: "0 4px 12px rgba(0,0,0,0.08)",
-              background: "#fff",
-              padding: "10px",
-              resize: "none",
-              outline: "none",
-            }}
-          />
-
-          <button
-            onClick={() => askQuestion(panelId)}
-            disabled={panelLoading || (!panelThreadId && !isSecondary)}
-            style={{
-              marginTop: "0.5rem",
-              width: "96%",
-              borderRadius: UI_RADIUS,
-              padding: "10px 0",
-              border: "1px solid #ddd",
-              boxShadow: "0 4px 12px rgba(0,0,0,0.08)",
-              background: "transparent",
-              cursor: "pointer",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
+              position: "relative",
+              width: "100%",
             }}
           >
-            {panelLoading ? (
-              "Thinking..."
-            ) : (
-              <svg
-                width="18"
-                height="18"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                aria-hidden="true"
+            {panelId === "primary" && context?.type === "image" && (
+              <div
+                style={{
+                  marginBottom: "6px",
+                  fontSize: "0.8rem",
+                  color: "#A48D78",
+                }}
               >
-                <path d="M12 19V5" />
-                <path d="M5 12l7-7 7 7" />
-              </svg>
+                {getContextLabel(context)}
+              </div>
             )}
-          </button>
+            <textarea
+              value={panelQuestion}
+              onChange={(e) => setPanelQuestion(e.target.value)}
+              style={{
+                width: "100%",
+                height: "90px",
+                borderRadius: UI_RADIUS,
+                border: "1px solid #ddd",
+                boxShadow: "0 4px 12px rgba(0,0,0,0.08)",
+                background: "#fff",
+                padding: "8px 10px 20px 10px",
+                boxSizing: "border-box",
+                resize: "none",
+                outline: "none",
+              }}
+            />
+
+            <button
+              onClick={() => askQuestion(panelId)}
+              disabled={panelLoading || (!panelThreadId && !isSecondary)}
+              onMouseEnter={() => setHoveredSendPanelId(panelId)}
+              onMouseLeave={() =>
+                setHoveredSendPanelId(prev => (prev === panelId ? null : prev))
+              }
+              style={{
+                position: "absolute",
+                left: "50%",
+                bottom: "12px",
+                transform: "translateX(-50%)",
+                background: hoveredSendPanelId === panelId ? "#eee6ddff" : "transparent",
+                border: "none",
+                padding: "4px 6px",
+                borderRadius: "999px",
+                cursor: "pointer",
+                color: "#111",
+                opacity: panelLoading ? 0.6 : 1,
+              }}
+              aria-label="Send"
+            >
+              {panelLoading ? (
+                "..."
+              ) : (
+                <svg
+                  width="18"
+                  height="18"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M12 19V5" />
+                  <path d="M5 12l7-7 7 7" />
+                </svg>
+              )}
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -1810,22 +2462,25 @@ export default function Home() {
       style={{
         display: "flex",
         height: "100vh",
+        background: "#FAF9F6",
         overflow: "hidden", // ← critical
       }}
     >
       {/* Sidebar */}
       <div
         style={{
-          width: sidebarOpen ? Math.max(180, sidebarWidth - 16) : 0,
+          width: sidebarOpen ? Math.max(MIN_SIDEBAR_WIDTH, sidebarWidth - 16) : 0,
           height: sidebarOpen ? "calc(100% - 16px)" : "100%",
           margin: sidebarOpen ? "8px 0 8px 8px" : "0",
           overflowY: "auto",
           overflowX: "hidden",
           transition: "width 0.2s ease",
-          border: sidebarOpen ? "1px solid #ddd" : "none",
-          borderRadius: "12px",
-          boxShadow: sidebarOpen ? "0 4px 12px rgba(0,0,0,0.08)" : "none",
-          background: "#fff",
+          // border: sidebarOpen ? "1px solid #ddd" : "none",
+          // borderRadius: "12px",
+          // boxShadow: sidebarOpen ? "0 4px 12px rgba(0,0,0,0.08)" : "none",
+          // background: "#fff",
+          background: "#FAF9F6",
+          color: "#442913",
           boxSizing: "border-box",
         }}
       >
@@ -1845,15 +2500,15 @@ export default function Home() {
             display: "flex",
             justifyContent: "space-between",
             alignItems: "center",
-            padding: "8px",
-            borderBottom: "1px solid #333",
+            padding: "12px 8px 8px",
+            borderBottom: "1px solid #A48D78",
             fontWeight: 600,
           }}
         >
           <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
             {currentFolderId !== null && (
               <span
-                style={{ cursor: "pointer" }}
+                style={{ cursor: "pointer", position: "relative", top: "2px" }}
                 onClick={() => {
                   const prevId = folderStack.at(-1) ?? null;
                   setCurrentFolderId(prevId);
@@ -1867,7 +2522,21 @@ export default function Home() {
                   }
                 }}
               >
-                ←
+                <svg
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.5"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M19 12H6" />
+                  <path d="M6 12l5-5" />
+                  <path d="M6 12l5 5" />
+                </svg>
               </span>
             )}
 
@@ -1887,7 +2556,7 @@ export default function Home() {
             style={{
               padding: "6px",
               borderBottom: "1px solid #c7dcff",
-              background: "#e6f0ff",
+              background: "#eee6ddff",
               borderRadius: "6px",
               margin: "6px",
             }}
@@ -1927,6 +2596,7 @@ export default function Home() {
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({
                     folder_id: currentFolderId,
+                    title: "New Chat",
                   }),
                 });
 
@@ -1940,6 +2610,8 @@ export default function Home() {
                     id: data.file_id,
                     title: data.title,
                     folder_id: currentFolderId,
+                    parent_file_id: null,
+                    s3_key: null,
                   },
                   ...prev,
                 ]);
@@ -1973,9 +2645,16 @@ export default function Home() {
                 padding: "8px",
                 cursor: "pointer",
                 fontWeight: 500,
-                color: "#000",
+                // color: "#000",
+                color: "#442913",
                 userSelect: "none",
+                background:
+                  hoveredFolderId === folder.id ? "#eee6ddff" : "transparent",
               }}
+              onMouseEnter={() => setHoveredFolderId(folder.id)}
+              onMouseLeave={() =>
+                setHoveredFolderId(prev => (prev === folder.id ? null : prev))
+              }
               onMouseDown={() => {
                 // If menu already open, do nothing
                 if (folderActionsOpenId === folder.id) return;
@@ -2121,144 +2800,7 @@ export default function Home() {
 
 
           {/* Files */}
-          {visibleFiles.map(file => (
-            <div
-              className="file-row"
-              key={file.id}
-              onDoubleClick={(e) => {
-                e.stopPropagation();
-                setFileActionsOpenId(prev =>
-                  prev === file.id ? null : file.id
-                );
-              }}
-              onClick={() => {
-                if (renamingFileId === file.id) return;
-                if (fileActionsOpenId === file.id) return;
-
-                // EXIT standalone chat mode
-                activeFileVersionRef.current += 1;
-
-                setPdfUrl(null);
-                setNumPages(0);
-                setHighlights([]);
-                setActiveAnnotationId(null);
-                setContext(null);
-
-                setActiveFileId(file.id);
-              }}
-
-              style={{
-                position: "relative",
-                padding: "8px",
-                cursor: "pointer",
-                background: file.id === activeFileId ? "#e5f0ff" : "transparent",
-              }}
-            >
-              {renamingFileId === file.id ? (
-                <input
-                  autoFocus
-                  value={renameValue}
-                  onChange={e => setRenameValue(e.target.value)}
-                  onBlur={async () => {
-                    await renameFile(file.id, renameValue);
-                    setRenamingFileId(null);
-                  }}
-                  onKeyDown={async e => {
-                    if (e.key === "Enter") {
-                      await renameFile(file.id, renameValue);
-                      setRenamingFileId(null);
-                    }
-                    if (e.key === "Escape") {
-                      setRenamingFileId(null);
-                    }
-                  }}
-                />
-              ) : (
-                <div style={{ display: "flex", justifyContent: "space-between" }}>
-                  <span style={{ display: "flex", alignItems: "center" }}>
-                    <FileIcon />
-                    {file.title}
-                  </span>
-
-
-                  {fileActionsOpenId === file.id && (
-                    <div
-                      onClick={e => e.stopPropagation()}
-                      style={{
-                        position: "absolute",
-                        right: "8px",
-                        top: "50%",
-                        transform: "translateY(-50%)",
-                        display: "flex",
-                        alignItems: "center",
-                        background: "#fff",
-                        borderRadius: "8px",
-                        padding: "6px 8px",
-                        boxShadow: "0 4px 12px rgba(0,0,0,0.08)",
-                        fontSize: "0.85rem",
-                        zIndex: 50,
-                      }}
-                    >
-                      {/* Rename */}
-                      <span
-                        style={{
-                          padding: "2px 6px",
-                          cursor: "pointer",
-                          borderRadius: "4px",
-                        }}
-                        onClick={() => {
-                          setRenamingFileId(file.id);
-                          setRenameValue(file.title);
-                          setFileActionsOpenId(null);
-                        }}
-                        onMouseEnter={e =>
-                          (e.currentTarget.style.background = "#f5f5f5")
-                        }
-                        onMouseLeave={e =>
-                          (e.currentTarget.style.background = "transparent")
-                        }
-                      >
-                        Rename
-                      </span>
-
-                      {/* Divider */}
-                      <div
-                        style={{
-                          width: "1px",
-                          height: "90%",
-                          background: "#ddd",
-                          margin: "0 6px",
-                        }}
-                      />
-
-                      {/* Delete */}
-                      <span
-                        style={{
-                          padding: "2px 6px",
-                          cursor: "pointer",
-                          color: "#e53935",
-                          borderRadius: "4px",
-                        }}
-                        onClick={() => {
-                          deleteFile(file.id);
-                          setFileActionsOpenId(null);
-                        }}
-                        onMouseEnter={e =>
-                          (e.currentTarget.style.background = "#fdecea")
-                        }
-                        onMouseLeave={e =>
-                          (e.currentTarget.style.background = "transparent")
-                        }
-                      >
-                        Delete
-                      </span>
-                    </div>
-                  )}
-
-                </div>
-              )}
-            </div>
-          ))}
+          {rootFiles.map(file => renderFileTree(file, 0))}
 
         </div>
 
@@ -2274,260 +2816,374 @@ export default function Home() {
         />
       )}
 
-    {pdfUrl !== null && (
       <div
         style={{
-          width: `${100 - chatWidth}%`,
-          height: "100%",
-          padding: "1rem",
-          overflow: "auto",
-          minHeight: 0,
+          flex: 1,
+          margin: "12px",
+          height: "calc(100% - 24px)",
+          border: "1px solid #ddd",
+          borderRadius: "12px",
+          boxShadow: "0 4px 12px rgba(0,0,0,0.08)",
+          // background: "#fff",
+          background: "#fff",
+          boxSizing: "border-box",
+          display: "flex",
+          overflow: "hidden",
         }}
       >
-        {/* PDF Viewer */}
-        <button
-          onClick={() => setSidebarOpen(v => !v)}
-          style={{
-            marginBottom: "0.5rem",
-            background: "transparent",
-            border: "none",
-            padding: 0,
-            cursor: "pointer",
-            lineHeight: 0,
-            color: "#666",
-          }}
-          aria-label={sidebarOpen ? "Close sidebar" : "Open sidebar"}
-        >
-          <svg
-            width="34"
-            height="24"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            aria-hidden="true"
-          >
-            {sidebarOpen ? (
-              <>
-                <path d="M15 6l-6 6 6 6" />
-                <path d="M19 6l-6 6 6 6" />
-              </>
-            ) : (
-              <>
-                <path d="M9 6l6 6-6 6" />
-                <path d="M5 6l6 6-6 6" />
-              </>
-            )}
-          </svg>
-        </button>
-        <div
-          ref={pdfContentRef}
-          style={{ width: "100%" }}
-        >
-          <input
-            type="range"
-            min={0.6}
-            max={2}
-            step={0.05}
-            value={pdfScale}
-            onChange={(e) => setPdfScale(Number(e.target.value))}
+        {pdfUrl !== null && (
+          <div
             style={{
-              width: "100%",
-              marginBottom: "0.75rem",
-              background: `linear-gradient(
-                to right,
-                #000 0%,
-                #000 ${((pdfScale - 0.6) / (2 - 0.6)) * 100}%,
-                #ccc ${((pdfScale - 0.6) / (2 - 0.6)) * 100}%,
-                #ccc 100%
-              )`,
+              width: `${100 - chatWidth}%`,
+              height: "100%",
+              padding: "0 1rem 1rem",
+              minHeight: 0,
+              display: "flex",
+              flexDirection: "column",
             }}
-          />
-        </div>
+          >
+            <div
+              style={{
+                position: "sticky",
+                top: 0,
+                zIndex: 20,
+                background: "#fff",
+                padding: "1rem 0 0.5rem",
+              }}
+            >
+              {/* PDF Viewer */}
+              <button
+                onClick={() => setSidebarOpen(v => !v)}
+                style={{
+                  marginBottom: "0.25rem",
+                  background: "transparent",
+                  border: "none",
+                  padding: 0,
+                  cursor: "pointer",
+                  lineHeight: 0,
+                  color: "#A48D78",
+                }}
+                aria-label={sidebarOpen ? "Close sidebar" : "Open sidebar"}
+              >
+                <svg
+                  width="34"
+                  height="24"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  {sidebarOpen ? (
+                    <path d="M15 6l-6 6 6 6" />
+                  ) : (
+                    <path d="M9 6l6 6-6 6" />
+                  )}
+                </svg>
+              </button>
+              <div
+                ref={pdfContentRef}
+                style={{ width: "100%" }}
+              >
+                {/* Zoom slider removed; PDF auto-fits panel width */}
+              </div>
+            </div>
 
-
-
-        {pdfUrl && (
-          <Document key={activeFileId} file={pdfUrl} onLoadSuccess={({ numPages }) => setNumPages(numPages)}>
-            {Array.from({ length: numPages }, (_, i) => {
-              const pageNumber = i + 1;
-              const pageHighlights = highlights.filter(h => h.page === pageNumber);
-
-              return (
-                <div
-                  key={pageNumber}
-                  data-page-number={pageNumber}
-                  ref={el => (pageRefs.current[pageNumber] = el)}
-                  onDoubleClick={() => {
-                    setRegionMode(true);
-                    setActivePage(pageNumber);
-                    setDragRect(null);
+            <div
+              ref={pdfScrollRef}
+              style={{ overflow: "auto", flex: 1, minHeight: 0 }}
+            >
+              {pdfUrl && (
+                <Document
+                  key={pdfUrl}
+                  file={pdfUrl}
+                  onLoadSuccess={(doc) => {
+                    setNumPages(doc.numPages);
+                    setPdfLoadedUrl(pdfUrl);
+                    setPdfReady(true);
                   }}
-                  style={{
-                    position: "relative",
-                    marginBottom: "1.5rem",
-                    display: "inline-block",
-                    boxShadow: "0 4px 10px rgba(0,0,0,0.06)",
-                    borderRadius: "8px",
-                    background: "#fff",
+                  onLoadError={() => {
+                    setPdfReady(false);
+                    setNumPages(0);
+                    setPdfLoadedUrl(null);
                   }}
                 >
-                  {pdfContentWidth > 0 && (
-                    <Page
-                      pageNumber={pageNumber}
-                      width={pdfContentWidth * PDF_INSET * pdfScale}
-                      renderTextLayer
-                      renderAnnotationLayer={false}
-                    />
-                  )}
+                  {pdfReady && pdfLoadedUrl === pdfUrl &&
+                    Array.from({ length: numPages }, (_, i) => {
+                    const pageNumber = i + 1;
+                    const pageHighlights = highlights.filter(
+                      h => h.page === pageNumber
+                    );
 
-                 {/* Visual highlight */}
-                  <div
-                    style={{
-                      position: "absolute",
-                      inset: 0,
-                      pointerEvents: "none",
-                      zIndex: 5,
-                    }}
-                  >
-                    {pageHighlights.map(h => (
+                    return (
                       <div
-                        key={`visual-${h.annotation_id}`}
-                        style={{
-                          position: "absolute",
-                          left: `${h.rect.x * 100}%`,
-                          top: `${h.rect.y * 100}%`,
-                          width: `${h.rect.width * 100}%`,
-                          height: `${h.rect.height * 100}%`,
-                          background:
-                            h.annotation_id === activeAnnotationId
-                              ? "rgba(0,112,243,0.08)"
-                              : "rgba(255, 235, 59, 0.18)",
-                          borderRadius: "10px",
-                        }}
-                      />
-                    ))}
-                  </div>
-
-                  {/* Click hitboxes */}
-                  <div
-                    style={{
-                      position: "absolute",
-                      inset: 0,
-                      pointerEvents: "none",
-                      zIndex: 20, // 👈 higher than everything else
-                    }}
-                  >
-                    {pageHighlights.map(h => (
-                      <div
-                        key={`hit-${h.annotation_id}`}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          activateAnnotation(h.annotation_id, "primary");
+                        key={pageNumber}
+                        data-page-number={pageNumber}
+                        ref={el => (pageRefs.current[pageNumber] = el)}
+                        onDoubleClick={() => {
+                          setRegionMode(true);
+                          setActivePage(pageNumber);
+                          setDragRect(null);
                         }}
                         style={{
-                          position: "absolute",
-                          left: `${h.rect.x * 100}%`,
-                          top: `${h.rect.y * 100}%`,
-                          width: `${h.rect.width * 100}%`,
-                          height: `${h.rect.height * 100}%`,
-                          pointerEvents: "auto",
-                          cursor: "pointer",
+                          position: "relative",
+                          marginBottom: "1.5rem",
+                          display: "inline-block",
+                          boxShadow: "0 4px 10px rgba(0,0,0,0.06)",
+                          borderRadius: "8px",
+                          background: "#fff",
                         }}
-                      />
-                    ))}
-                  </div>
+                      >
+                        {pdfContentWidth > 0 && (
+                          <Page
+                            pageNumber={pageNumber}
+                            width={pdfContentWidth * PDF_INSET * pdfScale}
+                            renderTextLayer
+                            renderAnnotationLayer={false}
+                          />
+                        )}
 
-
-                  {regionMode && activePage === pageNumber && (
-                    <div
-                      onMouseDown={(e) => {
-                        const r = e.currentTarget.getBoundingClientRect();
-                        setDragStart({
-                          x: e.clientX - r.left,
-                          y: e.clientY - r.top,
-                        });
-                      }}
-                      onMouseMove={(e) => {
-                        if (!dragStart) return;
-                        const r = e.currentTarget.getBoundingClientRect();
-                        const x = e.clientX - r.left;
-                        const y = e.clientY - r.top;
-
-                        setDragRect({
-                          x: Math.min(dragStart.x, x),
-                          y: Math.min(dragStart.y, y),
-                          width: Math.abs(x - dragStart.x),
-                          height: Math.abs(y - dragStart.y),
-                        });
-                      }}
-                      onMouseUp={async (e) => {
-                        if (dragRect) {
-                          await uploadRegion(pageNumber, dragRect, e.currentTarget.parentElement!);
-                        }
-                        setRegionMode(false);
-                        setDragStart(null);
-                        setDragRect(null);
-                      }}
-                      style={{
-                        position: "absolute",
-                        inset: 0,
-                        cursor: "crosshair",
-                        zIndex: 10,
-                      }}
-                    >
-                      {dragRect && (
+                        {/* Visual highlight */}
                         <div
                           style={{
                             position: "absolute",
-                            left: dragRect.x,
-                            top: dragRect.y,
-                            width: dragRect.width,
-                            height: dragRect.height,
-                            border: "2px dashed #0070f3",
-                            background: "rgba(0,112,243,0.15)",
+                            inset: 0,
+                            pointerEvents: "none",
+                            zIndex: 5,
                           }}
-                        />
-                      )}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </Document>
+                        >
+                          {pageHighlights.map(h => (
+                            <div
+                              key={`visual-${h.annotation_id}`}
+                              style={{
+                                position: "absolute",
+                                left: `${h.rect.x * 100}%`,
+                                top: `${h.rect.y * 100}%`,
+                                width: `${h.rect.width * 100}%`,
+                                height: `${h.rect.height * 100}%`,
+                                background:
+                                  h.annotation_id === activeAnnotationId
+                                    ? "rgba(203, 185, 164, 0.35)"
+                                    : "rgba(255, 235, 59, 0.18)",
+                                borderRadius: "10px",
+                              }}
+                            />
+                          ))}
+                        </div>
+
+                        {/* Click hitboxes */}
+                        <div
+                          style={{
+                            position: "absolute",
+                            inset: 0,
+                            pointerEvents: "none",
+                            zIndex: 20,
+                          }}
+                        >
+                          {pageHighlights.map(h => (
+                            <Fragment key={`hit-${h.annotation_id}`}>
+                              <div
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (suppressPdfHighlightClickRef.current) {
+                                    suppressPdfHighlightClickRef.current = false;
+                                    return;
+                                  }
+                                  activateAnnotation(h.annotation_id, "primary");
+                                }}
+                                data-annotation-id={h.annotation_id}
+                                onMouseDown={() => {
+                                  pdfHighlightHoldFiredRef.current = false;
+                                  if (pdfHighlightHoldTimerRef.current) {
+                                    window.clearTimeout(
+                                      pdfHighlightHoldTimerRef.current
+                                    );
+                                  }
+
+                                  pdfHighlightHoldTimerRef.current =
+                                    window.setTimeout(() => {
+                                      pdfHighlightHoldFiredRef.current = true;
+                                      suppressPdfHighlightClickRef.current = true;
+                                      setPendingDeleteAnnotationId(h.annotation_id);
+                                      setPendingDeletePanelId("primary");
+                                    }, 400);
+                                }}
+                                onMouseUp={() => {
+                                  if (pdfHighlightHoldTimerRef.current) {
+                                    window.clearTimeout(
+                                      pdfHighlightHoldTimerRef.current
+                                    );
+                                    pdfHighlightHoldTimerRef.current = null;
+                                  }
+
+                                  if (pdfHighlightHoldFiredRef.current) {
+                                    suppressPdfHighlightClickRef.current = true;
+                                  }
+                                }}
+                                onMouseLeave={() => {
+                                  if (pdfHighlightHoldTimerRef.current) {
+                                    window.clearTimeout(
+                                      pdfHighlightHoldTimerRef.current
+                                    );
+                                    pdfHighlightHoldTimerRef.current = null;
+                                  }
+                                }}
+                                style={{
+                                  position: "absolute",
+                                  left: `${h.rect.x * 100}%`,
+                                  top: `${h.rect.y * 100}%`,
+                                  width: `${h.rect.width * 100}%`,
+                                  height: `${h.rect.height * 100}%`,
+                                  pointerEvents: "auto",
+                                  cursor: "pointer",
+                                }}
+                              />
+
+                              {pendingDeleteAnnotationId === h.annotation_id &&
+                                pendingDeletePanelId === "primary" && (
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      deleteAnnotation(h.annotation_id, "primary");
+                                    }}
+                                    data-delete-annotation
+                                    style={{
+                                      position: "absolute",
+                                      left: `${(h.rect.x + h.rect.width) * 100}%`,
+                                      top: `${h.rect.y * 100}%`,
+                                      transform: "translate(-8px, -8px)",
+                                      width: "20px",
+                                      height: "20px",
+                                      borderRadius: "999px",
+                                      border: "1px solid #ddd",
+                                      background: "#fff",
+                                      color: "#ff6b6b",
+                                      fontSize: "0.8rem",
+                                      fontWeight: 700,
+                                      lineHeight: 1,
+                                      cursor: "pointer",
+                                      pointerEvents: "auto",
+                                      boxShadow:
+                                        "0 4px 10px rgba(0,0,0,0.08)",
+                                    }}
+                                    aria-label="Delete highlight"
+                                  >
+                                    x
+                                  </button>
+                                )}
+                            </Fragment>
+                          ))}
+                        </div>
+
+                        {regionMode && activePage === pageNumber && (
+                          <div
+                            onMouseDown={(e) => {
+                              const r = e.currentTarget.getBoundingClientRect();
+                              setDragStart({
+                                x: e.clientX - r.left,
+                                y: e.clientY - r.top,
+                              });
+                            }}
+                            onMouseMove={(e) => {
+                              if (!dragStart) return;
+                              const r = e.currentTarget.getBoundingClientRect();
+                              const x = e.clientX - r.left;
+                              const y = e.clientY - r.top;
+
+                              setDragRect({
+                                x: Math.min(dragStart.x, x),
+                                y: Math.min(dragStart.y, y),
+                                width: Math.abs(x - dragStart.x),
+                                height: Math.abs(y - dragStart.y),
+                              });
+                            }}
+                            onMouseUp={async (e) => {
+                              if (dragRect) {
+                                await uploadRegion(
+                                  pageNumber,
+                                  dragRect,
+                                  e.currentTarget.parentElement!
+                                );
+                              }
+                              setRegionMode(false);
+                              setDragStart(null);
+                              setDragRect(null);
+                            }}
+                            style={{
+                              position: "absolute",
+                              inset: 0,
+                              cursor: "crosshair",
+                              zIndex: 10,
+                            }}
+                          >
+                            {dragRect && (
+                              <div
+                                style={{
+                                  position: "absolute",
+                                  left: dragRect.x,
+                                  top: dragRect.y,
+                                  width: dragRect.width,
+                                  height: dragRect.height,
+                                  border: "2px dashed #0070f3",
+                                  background: "rgba(0,112,243,0.15)",
+                                }}
+                              />
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </Document>
+              )}
+            </div>
+          </div>
         )}
 
+        {pdfUrl !== null && (
+          <div
+            onMouseDown={() => setIsResizing(true)}
+            onMouseEnter={() => setHoveredChatDivider(true)}
+            onMouseLeave={() => setHoveredChatDivider(false)}
+            style={{
+              width: "10px",
+              cursor: "col-resize",
+              background: "transparent",
+              userSelect: "none",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            <div
+              style={{
+                width: "4px",
+                height: "80%",
+                background: hoveredChatDivider ? "#eee6ddff" : "transparent",
+                borderRadius: "999px",
+                transition: "background 0.15s ease",
+              }}
+            />
+          </div>
+        )}
 
-      </div>
-)}
-
-      {/* Resize Handle */}
+        {/* Chat Panels */}
         <div
-          onMouseDown={() => setIsResizing(true)}
+          data-chat-panels
           style={{
-            width: "1.5px",
-            cursor: "col-resize",
-            background: "transparent",
-            userSelect: "none",
+            width: pdfUrl === null ? "100%" : `${chatWidth}%`,
+            display: "flex",
+            flexDirection: "row",
+            height: "100%",
+            overflow: "hidden",
+            gap: showSecondaryChat ? "1rem" : 0,
           }}
-        />
-
-      {/* Chat Panels */}
-      <div
-        data-chat-panels
-        style={{
-          width: pdfUrl === null ? "100%" : `${chatWidth}%`,
-          display: "flex",
-          flexDirection: "row",
-          height: "100%",
-          overflow: "hidden",
-          gap: showSecondaryChat ? "1rem" : 0,
-        }}
-      >
-        {renderChatPanel("primary")}
-        {showSecondaryChat && renderChatPanel("secondary")}
+        >
+          {renderChatPanel("primary")}
+          {showSecondaryChat && renderChatPanel("secondary")}
+        </div>
       </div>
       {!regionMode && (
           <div
@@ -2569,19 +3225,45 @@ export default function Home() {
                 >
                   New chat
                 </span>
+
+                <span style={{ opacity: 0.4 }}>|</span>
+
+                <span
+                  style={{ cursor: "pointer", padding: "4px 6px" }}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    setTitleFromSelection();
+                  }}
+                >
+                  Set title
+                </span>
               </>
             )}
 
             {popupMode === "pdf" && (
-              <span
-                style={{ cursor: "pointer", padding: "4px 6px" }}
-                onMouseDown={(e) => {
-                  e.preventDefault();
-                  handlePopupConfirm();
-                }}
-              >
-                Add to chat
-              </span>
+              <>
+                <span
+                  style={{ cursor: "pointer", padding: "4px 6px" }}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    handlePopupConfirm();
+                  }}
+                >
+                  Add to chat
+                </span>
+
+                <span style={{ opacity: 0.4 }}>|</span>
+
+                <span
+                  style={{ cursor: "pointer", padding: "4px 6px" }}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    setTitleFromSelection();
+                  }}
+                >
+                  Set title
+                </span>
+              </>
             )}
           </div>
         )}

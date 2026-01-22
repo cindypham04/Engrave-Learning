@@ -1,3 +1,4 @@
+# API routes for files, chats, annotations, and PDF region workflows.
 from fastapi import FastAPI, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -37,6 +38,7 @@ from db import (
     create_standalone_chat,
     save_chat_highlight,
     get_chat_highlights_by_document,
+    get_chat_thread_by_annotation,
 )
 
 
@@ -186,6 +188,8 @@ You are an educational assistant whose primary goal is deep understanding, not m
 
 Always explain ideas in a way that matches how a learner thinks before they fully understand the topic.
 
+Your role is to explain concepts in clear, simple language while ensuring that all necessary technical terms and key details are included. Break down complex jargon into relatable examples or analogies, and clarify why each concept matters. 
+
 Follow these principles for every response:
 
 STRUCTURE RULE:
@@ -305,7 +309,13 @@ Do not repeat the same equation in multiple formats.
 
 Never write such expressions as plain text.
 
-13. Formatting rules (STRICT):
+13. When the user asks about mathematical equations, write the full equation first, then explain each component step by step. 
+
+If the user asks about a knowledge that's based on math in nature, always include the relevant equations in your explanation.
+
+Keep explanations friendly, engaging, and supportive, but never omit essential knowledge, especially when the user asks about AI knowledge, include the math behind it. 
+
+14. Formatting rules (STRICT):
 
 Use Markdown formatting.
 
@@ -432,6 +442,7 @@ class CreateChatThread(BaseModel):
 class CreateStandaloneChatRequest(BaseModel):
     folder_id: Optional[int] = None
     title: Optional[str] = None
+    source_annotation_id: Optional[int] = None
 
 
 # Get the pdf file from frontend then write it into S3
@@ -554,16 +565,13 @@ def get_file_state(file_id: int):
             detail="No chat threads found for file"
         )
 
-    # Pick document-level thread as default
+    # Pick document-level thread as default; fallback to first thread
     doc_thread = next(
         (t for t in threads if t["source_annotation_id"] is None),
         None
     )
     if not doc_thread:
-        raise HTTPException(
-            status_code=500,
-            detail="Document-level chat thread missing"
-        )
+        doc_thread = threads[0]
 
     # CHAT FILE (no PDF)
     if not file["s3_key"]:
@@ -672,6 +680,7 @@ def upload_region_endpoint(
 # Get question from frontend
 @app.post("/ask")
 def ask_document(req: AskQuestion):
+    # Run chat logic and persist messages for either chat-only or PDF-backed files.
     # --------------------------------------------------
     # 0. Basic validation
     # --------------------------------------------------
@@ -720,6 +729,7 @@ def ask_document(req: AskQuestion):
             annotation_id=req.annotation_id,
         )
 
+        commit()
         return {
             "answer": answer,
             "user_message_id": user_message_id,
@@ -783,6 +793,7 @@ Question:
                 annotation_id=req.annotation_id,
             )
 
+            commit()
             return {
                 "answer": answer,
                 "user_message_id": user_message_id,
@@ -852,6 +863,7 @@ Question:
             annotation_id=req.annotation_id,
         )
 
+        commit()
         return {
             "answer": answer,
             "user_message_id": user_message_id,
@@ -862,6 +874,7 @@ Question:
     # 4. DOCUMENT-LEVEL QUESTION (NO ANNOTATION)
     # --------------------------------------------------
     if not pages:
+        commit()
         return {"answer": "Document not found."}
 
     prompt = f"""
@@ -884,6 +897,7 @@ Question:
         annotation_id=None,
     )
 
+    commit()
     return {
         "answer": answer,
         "user_message_id": user_message_id,
@@ -1065,10 +1079,16 @@ def create_standalone_chat_endpoint(
         user_id=user_id,
         folder_id=payload.folder_id,
         title=payload.title,
+        source_annotation_id=payload.source_annotation_id,
     )
 
     commit()
     return result
+
+@app.get("/chat/thread/by-annotation/{annotation_id}")
+def get_thread_by_annotation(annotation_id: int):
+    thread = get_chat_thread_by_annotation(annotation_id)
+    return {"thread": thread}
 
 
 

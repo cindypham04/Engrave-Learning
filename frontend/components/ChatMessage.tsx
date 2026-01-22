@@ -1,5 +1,6 @@
 "use client";
 
+import { useRef } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
@@ -14,6 +15,7 @@ export type ChatMessageProps = {
   content: string;
   onClick?: () => void;
   onHighlightClick?: (annotationId: number) => void;
+  onHighlightHold?: (annotationId: number, rect: DOMRect) => void;
   messageId?: number;
   messageIndex?: number;
   panelId?: string;
@@ -30,6 +32,7 @@ export default function ChatMessage({
   content,
   onClick,
   onHighlightClick,
+  onHighlightHold,
   messageId,
   messageIndex,
   panelId,
@@ -40,8 +43,46 @@ export default function ChatMessage({
   const hasHighlights = highlights.length > 0;
   const highlightBg = (annotationId: number) =>
     annotationId === activeAnnotationId
-      ? "rgba(0,112,243,0.15)" // active = blue
+      ? "#cbb9a4" // active
       : "rgba(255, 235, 59, 0.35)"; // inactive = yellow
+
+  const normalizeMathContent = (text: string) => {
+    const lines = text.split("\n");
+    const normalized: string[] = [];
+    const buffer: string[] = [];
+
+    const flushBuffer = () => {
+      if (!buffer.length) return;
+      const eq = buffer.join(" ").trim();
+      normalized.push(`$$\n${eq}\n$$`);
+      buffer.length = 0;
+    };
+
+    for (const line of lines) {
+      const stripped = line.trim();
+
+      if (stripped.startsWith("$$") || stripped.startsWith("$")) {
+        flushBuffer();
+        normalized.push(line);
+        continue;
+      }
+
+      if (/^[A-Za-z][A-Za-z0-9_()]*\s*=\s*.*$/.test(stripped)) {
+        buffer.push(stripped);
+        continue;
+      }
+
+      flushBuffer();
+      normalized.push(line);
+    }
+
+    flushBuffer();
+    return normalized.join("\n");
+  };
+
+  const holdTimerRef = useRef<number | null>(null);
+  const holdFiredRef = useRef(false);
+  const suppressClickRef = useRef(false);
 
   const rehypeHighlight = () => {
     const sorted = [...highlights].sort((a, b) => a.start - b.start);
@@ -131,6 +172,11 @@ export default function ChatMessage({
       data-message-index={messageIndex}
       data-chat-panel-id={panelId}
       onClick={(e) => {
+        if (suppressClickRef.current) {
+          suppressClickRef.current = false;
+          return;
+        }
+
         const target = e.target as HTMLElement;
         const highlightEl = target.closest
           ? (target.closest("[data-annotation-id]") as HTMLElement | null)
@@ -148,11 +194,53 @@ export default function ChatMessage({
 
         onClick?.();
       }}
+      onMouseDown={(e) => {
+        const target = e.target as HTMLElement;
+        const highlightEl = target.closest
+          ? (target.closest("[data-annotation-id]") as HTMLElement | null)
+          : null;
+
+        if (!highlightEl || !onHighlightHold) return;
+
+        const annotationId = Number(
+          highlightEl.getAttribute("data-annotation-id")
+        );
+        if (Number.isNaN(annotationId)) return;
+        const rect = highlightEl.getBoundingClientRect();
+
+        holdFiredRef.current = false;
+        if (holdTimerRef.current) {
+          window.clearTimeout(holdTimerRef.current);
+        }
+
+        holdTimerRef.current = window.setTimeout(() => {
+          holdFiredRef.current = true;
+          suppressClickRef.current = true;
+          onHighlightHold(annotationId, rect);
+        }, 400);
+      }}
+      onMouseUp={() => {
+        if (holdTimerRef.current) {
+          window.clearTimeout(holdTimerRef.current);
+          holdTimerRef.current = null;
+        }
+
+        if (holdFiredRef.current) {
+          suppressClickRef.current = true;
+        }
+      }}
+      onMouseLeave={() => {
+        if (holdTimerRef.current) {
+          window.clearTimeout(holdTimerRef.current);
+          holdTimerRef.current = null;
+        }
+      }}
       style={{
         marginBottom: "1rem",
         padding: isUser ? "8px 10px" : "0",
         borderRadius: UI_RADIUS,
-        background: isUser ? "#e5f0ff" : "transparent",
+        background: isUser ? "#eee6ddff" : "transparent",
+        color: isUser ? "#000000ff" : "inherit",
         boxShadow: isUser ? "0 4px 12px rgba(0,0,0,0.08)" : "none",
         cursor: onClick ? "pointer" : "default",
         fontSize: "16px",
@@ -166,7 +254,7 @@ export default function ChatMessage({
             ...(hasHighlights ? [rehypeHighlight] : []),
           ]}
         >
-          {content}
+          {normalizeMathContent(content)}
         </ReactMarkdown>
 
     </div>

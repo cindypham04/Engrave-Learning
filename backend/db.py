@@ -1,3 +1,4 @@
+# SQLite helpers and cascade rules for files, chats, annotations, and highlights.
 # db.py
 import sqlite3
 import json
@@ -401,14 +402,36 @@ def list_files(user_id=1):
     cur = get_cursor()
     cur.execute(
         """
-        SELECT id, folder_id, title, s3_key, created_at
-        FROM files
-        WHERE user_id = ?
-        ORDER BY created_at DESC
+        SELECT
+            f.id,
+            f.folder_id,
+            f.title,
+            f.s3_key,
+            f.created_at,
+            pf.id AS parent_file_id
+        FROM files f
+        LEFT JOIN chat_threads ct
+            ON ct.file_id = f.id
+            AND ct.source_annotation_id IS NOT NULL
+            AND f.s3_key IS NULL
+        LEFT JOIN annotations a ON a.id = ct.source_annotation_id
+        LEFT JOIN files pf ON pf.document_id = a.document_id
+        WHERE f.user_id = ?
+        ORDER BY f.created_at DESC
         """,
         (user_id,)
     )
-    return [{"id": r[0], "folder_id": r[1], "title": r[2], "created_at": r[4]} for r in cur.fetchall()]
+    return [
+        {
+            "id": r[0],
+            "folder_id": r[1],
+            "title": r[2],
+            "s3_key": r[3],
+            "created_at": r[4],
+            "parent_file_id": r[5],
+        }
+        for r in cur.fetchall()
+    ]
 
 
 def update_file_s3_key(file_id, s3_key):
@@ -461,9 +484,55 @@ def rename_folder(folder_id: int, new_name: str):
 def delete_file_cascade(file_id: int):
     cur = get_cursor()
 
+    # Remove a file and all related chat threads, annotations, messages, and highlights.
     document_id = get_document_id_by_file(file_id)
     if not document_id:
         raise Exception("File not found")
+
+    # 0. Delete child chats created from highlights in this file
+    cur.execute(
+        """
+        SELECT id, file_id
+        FROM chat_threads
+        WHERE source_annotation_id IN (
+            SELECT id FROM annotations WHERE document_id = ?
+        )
+        """,
+        (document_id,),
+    )
+    child_threads = cur.fetchall()
+    for thread_id, child_file_id in child_threads:
+        if child_file_id and child_file_id != file_id:
+            delete_file_cascade(child_file_id)
+        else:
+            cur.execute(
+                """
+                DELETE FROM chat_highlights
+                WHERE message_id IN (
+                    SELECT id FROM messages WHERE chat_thread_id = ?
+                )
+                """,
+                (thread_id,),
+            )
+            cur.execute(
+                "DELETE FROM messages WHERE chat_thread_id = ?",
+                (thread_id,),
+            )
+            cur.execute(
+                "DELETE FROM chat_threads WHERE id = ?",
+                (thread_id,),
+            )
+
+    # 0. Delete chat highlights referencing messages from this document
+    cur.execute(
+        """
+        DELETE FROM chat_highlights
+        WHERE message_id IN (
+            SELECT id FROM messages WHERE document_id = ?
+        )
+        """,
+        (document_id,),
+    )
 
     # 1. Delete messages
     cur.execute(
@@ -503,6 +572,30 @@ def delete_file_cascade(file_id: int):
 
 def delete_annotation(annotation_id: int):
     cur = get_cursor()
+
+    # Remove an annotation and any child chats spawned from it.
+    # If this annotation spawned a standalone chat, delete that chat file too
+    cur.execute(
+        """
+        SELECT id, file_id
+        FROM chat_threads
+        WHERE source_annotation_id = ?
+        """,
+        (annotation_id,),
+    )
+    child_threads = cur.fetchall()
+    for thread_id, file_id in child_threads:
+        if file_id:
+            delete_file_cascade(file_id)
+        else:
+            cur.execute(
+                "DELETE FROM messages WHERE chat_thread_id = ?",
+                (thread_id,),
+            )
+            cur.execute(
+                "DELETE FROM chat_threads WHERE id = ?",
+                (thread_id,),
+            )
 
     # Get annotation (needed for region_s3_key)
     cur.execute(
@@ -781,6 +874,61 @@ def migrate_create_chat_threads_from_existing_data():
             (thread_id, msg_id),
         )
 
+def migrate_backfill_child_chat_threads():
+    cur = get_cursor()
+    cur.execute(
+        """
+        SELECT id, file_id
+        FROM chat_threads
+        WHERE source_annotation_id IS NULL
+          AND file_id IS NOT NULL
+        """
+    )
+    threads = cur.fetchall()
+
+    for thread_id, file_id in threads:
+        cur.execute(
+            """
+            SELECT annotation_id
+            FROM messages
+            WHERE chat_thread_id = ?
+              AND annotation_id IS NOT NULL
+            ORDER BY created_at ASC
+            LIMIT 1
+            """,
+            (thread_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            continue
+
+        annotation_id = row[0]
+        cur.execute(
+            "SELECT document_id FROM annotations WHERE id = ?",
+            (annotation_id,),
+        )
+        ann_row = cur.fetchone()
+        if not ann_row:
+            continue
+
+        cur.execute(
+            "SELECT document_id FROM files WHERE id = ?",
+            (file_id,),
+        )
+        file_row = cur.fetchone()
+        if not file_row:
+            continue
+
+        if ann_row[0] != file_row[0]:
+            cur.execute(
+                """
+                UPDATE chat_threads
+                SET source_annotation_id = ?
+                WHERE id = ?
+                """,
+                (annotation_id, thread_id),
+            )
+
 def get_child_folders(folder_id: int):
     cur = get_cursor()
     cur.execute(
@@ -803,6 +951,8 @@ def delete_folder_cascade(folder_id: int):
     # 1. Delete files in this folder
     file_ids = get_files_in_folder(folder_id)
     for file_id in file_ids:
+        if not get_document_id_by_file(file_id):
+            continue
         delete_file_cascade(file_id)
 
     # 2. Delete child folders (recursive)
@@ -834,6 +984,7 @@ def create_standalone_chat(
     user_id: int,
     folder_id: Optional[int] = None,
     title: Optional[str] = None,
+    source_annotation_id: Optional[int] = None,
 ):
     """
     Creates:
@@ -864,9 +1015,9 @@ def create_standalone_chat(
     cur.execute(
         """
         INSERT INTO chat_threads (file_id, source_annotation_id, title)
-        VALUES (?, NULL, ?)
+        VALUES (?, ?, ?)
         """,
-        (file_id, title),
+        (file_id, source_annotation_id, title),
     )
     thread_id = cur.lastrowid
 
@@ -875,6 +1026,30 @@ def create_standalone_chat(
         "document_id": document_id,
         "thread_id": thread_id,
         "title": title,
+    }
+
+def get_chat_thread_by_annotation(annotation_id: int):
+    cur = get_cursor()
+    cur.execute(
+        """
+        SELECT ct.id, ct.file_id, ct.source_annotation_id, ct.title, f.title
+        FROM chat_threads ct
+        JOIN files f ON f.id = ct.file_id
+        WHERE ct.source_annotation_id = ?
+        LIMIT 1
+        """,
+        (annotation_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+
+    return {
+        "id": row[0],
+        "file_id": row[1],
+        "source_annotation_id": row[2],
+        "title": row[3],
+        "file_title": row[4],
     }
 
 
@@ -891,6 +1066,7 @@ init_files()
 migrate_add_chat_thread_id_to_messages()
 init_chat_threads()
 init_chat_highlights()
+migrate_backfill_child_chat_threads()
 
 def rollback():
     conn.rollback()
