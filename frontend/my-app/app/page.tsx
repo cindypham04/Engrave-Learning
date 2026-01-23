@@ -54,6 +54,13 @@ type DragRect = {
   height: number;
 };
 
+type Rect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
 type ChatMsg = {
   id?: number;
   role: "user" | "assistant";
@@ -66,13 +73,9 @@ type ChatMsg = {
 
 type Highlight = {
   page: number;
-  annotation_id: number;   // 👈 ADD THIS
-  rect: {
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-  };
+  annotation_id: number;
+  type: "text" | "region" | "highlight";
+  rects: Rect[];
 };
 
 type ChatThread = {
@@ -93,6 +96,37 @@ type ChatHighlight = {
 /* ---------------- Main Component ---------------- */
 
 export default function Home() {
+
+  const mergeClientRectsByLine = (rawRects: DOMRect[], lineTolerance = 4) => {
+    const rects = rawRects
+      .filter(r => r.width > 0 && r.height > 0)
+      .sort((a, b) => (a.top === b.top ? a.left - b.left : a.top - b.top));
+
+    const lines: DOMRect[][] = [];
+
+    for (const rect of rects) {
+      const midY = (rect.top + rect.bottom) / 2;
+      const line = lines.find(group => {
+        const sample = group[0];
+        const sampleMidY = (sample.top + sample.bottom) / 2;
+        return Math.abs(sampleMidY - midY) <= lineTolerance;
+      });
+
+      if (line) {
+        line.push(rect);
+      } else {
+        lines.push([rect]);
+      }
+    }
+
+    return lines.map(group => {
+      const left = Math.min(...group.map(r => r.left));
+      const right = Math.max(...group.map(r => r.right));
+      const top = Math.min(...group.map(r => r.top));
+      const bottom = Math.max(...group.map(r => r.bottom));
+      return new DOMRect(left, top, right - left, bottom - top);
+    });
+  };
   
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
   const [numPages, setNumPages] = useState(0);
@@ -134,6 +168,7 @@ export default function Home() {
 
   // 🟡 Text: store raw DOM rect
   const pendingTextRectRef = useRef<DOMRect | null>(null);
+  const pendingTextRectsRef = useRef<DOMRect[] | null>(null);
 
   const pageRefs = useRef<Record<number, HTMLDivElement | null>>({});
 
@@ -230,7 +265,7 @@ export default function Home() {
   const [pdfContentWidth, setPdfContentWidth] = useState(0);
 
   // User select current or new chat in the selected text in the chat
-  const pendingChatActionRef = useRef<"current" | "new">("current");
+  const pendingChatActionRef = useRef<"current" | "new" | "highlight">("current");
 
   const [popupMode, setPopupMode] = useState<"chat" | "pdf" | null>(null);
 
@@ -672,11 +707,25 @@ export default function Home() {
     setHighlights(
       (data.annotations || [])
         .filter((a: any) => a.geometry)
-        .map((a: any) => ({
-          page: a.page_number,
-          annotation_id: a.id,
-          rect: a.geometry,
-        }))
+        .map((a: any) => {
+          const geometry = a.geometry;
+          let rects: Rect[] = [];
+
+          if (Array.isArray(geometry)) {
+            rects = geometry;
+          } else if (geometry?.rects && Array.isArray(geometry.rects)) {
+            rects = geometry.rects;
+          } else if (geometry) {
+            rects = [geometry];
+          }
+
+          return {
+            page: a.page_number,
+            annotation_id: a.id,
+            type: a.type,
+            rects,
+          };
+        })
     );
     setChatHighlights(data.chat_highlights || []);
     setSecondaryChatThreadId(null);
@@ -1533,6 +1582,8 @@ export default function Home() {
       const text = sel.toString().trim();
       if (!text) return;
 
+      pendingChatActionRef.current = "current";
+
       const range = sel.getRangeAt(0);
       const rect = range.getBoundingClientRect();
       const container = range.commonAncestorContainer as HTMLElement;
@@ -1592,6 +1643,7 @@ export default function Home() {
         }
 
         pendingTextRectRef.current = rect;
+        pendingTextRectsRef.current = null;
         showPopup(rect);
 
         // CRITICAL: stop processing permanently for this selection
@@ -1622,6 +1674,7 @@ export default function Home() {
       };
 
       pendingTextRectRef.current = rect;
+      pendingTextRectsRef.current = Array.from(range.getClientRects());
       setPopupMode("pdf");
 
       showPopup(rect);
@@ -1771,21 +1824,39 @@ export default function Home() {
 
       const pageRect = pageEl.getBoundingClientRect();
 
-      const geometry = {
-        x: (rect.left - pageRect.left) / pageRect.width,
-        y: (rect.top - pageRect.top) / pageRect.height,
-        width: rect.width / pageRect.width,
-        height: rect.height / pageRect.height,
-      };
+      const rawRects = pendingTextRectsRef.current ?? (rect ? [rect] : []);
+      const mergedRects = mergeClientRectsByLine(rawRects);
+      const rects = mergedRects
+        .map((clientRect) => ({
+          x: (clientRect.left - pageRect.left) / pageRect.width,
+          y: (clientRect.top - pageRect.top) / pageRect.height,
+          width: clientRect.width / pageRect.width,
+          height: clientRect.height / pageRect.height,
+        }))
+        .filter(
+          r =>
+            r.width > 0 &&
+            r.height > 0 &&
+            r.x < 1 &&
+            r.y < 1 &&
+            r.x + r.width > 0 &&
+            r.y + r.height > 0
+        );
 
+      if (!rects.length) {
+        cleanupPopup();
+        return;
+      }
+
+      const isReadHighlight = action === "highlight";
       const res = await fetch("http://localhost:8000/annotations", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           file_id: activeFileId,
           page_number: ctx.page,
-          type: "text",
-          geometry,
+          type: isReadHighlight ? "highlight" : "text",
+          geometry: rects,
           text: ctx.text,
         }),
       });
@@ -1802,9 +1873,15 @@ export default function Home() {
         {
           page: ctx.page,
           annotation_id: data.annotation_id,
-          rect: geometry,
+          type: isReadHighlight ? "highlight" : "text",
+          rects,
         },
       ]);
+
+      if (isReadHighlight) {
+        cleanupPopup();
+        return;
+      }
 
       setActiveAnnotationId(data.annotation_id);
       setContext({
@@ -1856,6 +1933,7 @@ export default function Home() {
   function cleanupPopup() {
     pendingTextRef.current = null;
     pendingTextRectRef.current = null;
+    pendingTextRectsRef.current = null;
     pendingChatHighlightRef.current = null;
     setPopupMode(null);
     pendingChatActionRef.current = "current";
@@ -1937,7 +2015,8 @@ export default function Home() {
       {
         page: pageNumber,
         annotation_id: data.annotation_id, 
-        rect: normalizedRect,
+        type: "region",
+        rects: [normalizedRect],
       },
     ]);
 
@@ -2916,6 +2995,14 @@ export default function Home() {
                     const pageHighlights = highlights.filter(
                       h => h.page === pageNumber
                     );
+                    const pageHighlightRects = pageHighlights.flatMap(h =>
+                      h.rects.map((rect, rectIndex) => ({
+                        h,
+                        rect,
+                        rectIndex,
+                        key: `${h.annotation_id}-${rectIndex}`,
+                      }))
+                    );
 
                     return (
                       <div
@@ -2951,22 +3038,24 @@ export default function Home() {
                             position: "absolute",
                             inset: 0,
                             pointerEvents: "none",
-                            zIndex: 5,
+                            zIndex: 2,
                           }}
                         >
-                          {pageHighlights.map(h => (
+                          {pageHighlightRects.map(({ h, rect, key }) => (
                             <div
-                              key={`visual-${h.annotation_id}`}
+                              key={`visual-${key}`}
                               style={{
                                 position: "absolute",
-                                left: `${h.rect.x * 100}%`,
-                                top: `${h.rect.y * 100}%`,
-                                width: `${h.rect.width * 100}%`,
-                                height: `${h.rect.height * 100}%`,
+                                left: `${rect.x * 100}%`,
+                                top: `${rect.y * 100}%`,
+                                width: `${rect.width * 100}%`,
+                                height: `${rect.height * 100}%`,
                                 background:
-                                  h.annotation_id === activeAnnotationId
-                                    ? "rgba(203, 185, 164, 0.35)"
-                                    : "rgba(255, 235, 59, 0.18)",
+                                  h.type === "highlight"
+                                    ? "rgba(180, 235, 190, 0.35)"
+                                    : h.annotation_id === activeAnnotationId
+                                      ? "rgba(203, 185, 164, 0.35)"
+                                      : "rgba(255, 235, 59, 0.18)",
                                 borderRadius: "10px",
                               }}
                             />
@@ -2982,8 +3071,8 @@ export default function Home() {
                             zIndex: 20,
                           }}
                         >
-                          {pageHighlights.map(h => (
-                            <Fragment key={`hit-${h.annotation_id}`}>
+                          {pageHighlightRects.map(({ h, rect, rectIndex, key }) => (
+                            <Fragment key={`hit-${key}`}>
                               <div
                                 onClick={(e) => {
                                   e.stopPropagation();
@@ -2991,6 +3080,7 @@ export default function Home() {
                                     suppressPdfHighlightClickRef.current = false;
                                     return;
                                   }
+                                  if (h.type === "highlight") return;
                                   activateAnnotation(h.annotation_id, "primary");
                                 }}
                                 data-annotation-id={h.annotation_id}
@@ -3032,16 +3122,17 @@ export default function Home() {
                                 }}
                                 style={{
                                   position: "absolute",
-                                  left: `${h.rect.x * 100}%`,
-                                  top: `${h.rect.y * 100}%`,
-                                  width: `${h.rect.width * 100}%`,
-                                  height: `${h.rect.height * 100}%`,
+                                  left: `${rect.x * 100}%`,
+                                  top: `${rect.y * 100}%`,
+                                  width: `${rect.width * 100}%`,
+                                  height: `${rect.height * 100}%`,
                                   pointerEvents: "auto",
                                   cursor: "pointer",
                                 }}
                               />
 
-                              {pendingDeleteAnnotationId === h.annotation_id &&
+                              {rectIndex === 0 &&
+                                pendingDeleteAnnotationId === h.annotation_id &&
                                 pendingDeletePanelId === "primary" && (
                                   <button
                                     onClick={(e) => {
@@ -3051,8 +3142,8 @@ export default function Home() {
                                     data-delete-annotation
                                     style={{
                                       position: "absolute",
-                                      left: `${(h.rect.x + h.rect.width) * 100}%`,
-                                      top: `${h.rect.y * 100}%`,
+                                      left: `${(rect.x + rect.width) * 100}%`,
+                                      top: `${rect.y * 100}%`,
                                       transform: "translate(-8px, -8px)",
                                       width: "20px",
                                       height: "20px",
@@ -3246,10 +3337,24 @@ export default function Home() {
                   style={{ cursor: "pointer", padding: "4px 6px" }}
                   onMouseDown={(e) => {
                     e.preventDefault();
+                    pendingChatActionRef.current = "current";
                     handlePopupConfirm();
                   }}
                 >
                   Add to chat
+                </span>
+
+                <span style={{ opacity: 0.4 }}>|</span>
+
+                <span
+                  style={{ cursor: "pointer", padding: "4px 6px" }}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    pendingChatActionRef.current = "highlight";
+                    handlePopupConfirm();
+                  }}
+                >
+                  Highlight
                 </span>
 
                 <span style={{ opacity: 0.4 }}>|</span>

@@ -5,6 +5,7 @@ import os
 import uuid
 import fitz
 from pydantic import BaseModel
+from typing import Union
 from typing import Optional, Literal
 from fastapi import HTTPException
 from dotenv import load_dotenv
@@ -189,6 +190,8 @@ You are an educational assistant whose primary goal is deep understanding, not m
 Always explain ideas in a way that matches how a learner thinks before they fully understand the topic.
 
 Your role is to explain concepts in clear, simple language while ensuring that all necessary technical terms and key details are included. Break down complex jargon into relatable examples or analogies, and clarify why each concept matters. 
+
+
 
 Follow these principles for every response:
 
@@ -407,8 +410,8 @@ def build_thread_history(
 class CreateAnnotation(BaseModel):
     file_id: int
     page_number: int
-    type: Literal["text", "region", "chat_text"]
-    geometry: Optional[dict] = None
+    type: Literal["text", "region", "chat_text", "highlight"]
+    geometry: Optional[Union[dict, list]] = None
     text: Optional[str] = None
     message_id: Optional[int] = None
     start: Optional[int] = None
@@ -680,7 +683,7 @@ def upload_region_endpoint(
 # Get question from frontend
 @app.post("/ask")
 def ask_document(req: AskQuestion):
-    # Run chat logic and persist messages for either chat-only or PDF-backed files.
+    # Doc: Run chat logic and persist messages for either chat-only or PDF-backed files.
     # --------------------------------------------------
     # 0. Basic validation
     # --------------------------------------------------

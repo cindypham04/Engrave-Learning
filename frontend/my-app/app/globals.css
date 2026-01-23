@@ -60,3 +60,14 @@ input[type="range"]::-moz-range-thumb {
   background: #000;
   border-radius: 50%;
 }
+
+/* Ensure PDF highlights render under text */
+.react-pdf__Page__canvas {
+  position: relative;
+  z-index: 1;
+}
+
+.react-pdf__Page__textContent {
+  position: absolute;
+  z-index: 3;
+}

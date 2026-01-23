@@ -46,40 +46,6 @@ export default function ChatMessage({
       ? "#cbb9a4" // active
       : "rgba(255, 235, 59, 0.35)"; // inactive = yellow
 
-  const normalizeMathContent = (text: string) => {
-    const lines = text.split("\n");
-    const normalized: string[] = [];
-    const buffer: string[] = [];
-
-    const flushBuffer = () => {
-      if (!buffer.length) return;
-      const eq = buffer.join(" ").trim();
-      normalized.push(`$$\n${eq}\n$$`);
-      buffer.length = 0;
-    };
-
-    for (const line of lines) {
-      const stripped = line.trim();
-
-      if (stripped.startsWith("$$") || stripped.startsWith("$")) {
-        flushBuffer();
-        normalized.push(line);
-        continue;
-      }
-
-      if (/^[A-Za-z][A-Za-z0-9_()]*\s*=\s*.*$/.test(stripped)) {
-        buffer.push(stripped);
-        continue;
-      }
-
-      flushBuffer();
-      normalized.push(line);
-    }
-
-    flushBuffer();
-    return normalized.join("\n");
-  };
-
   const holdTimerRef = useRef<number | null>(null);
   const holdFiredRef = useRef(false);
   const suppressClickRef = useRef(false);
@@ -148,7 +114,14 @@ export default function ChatMessage({
             tagName: "span",
             children: [{ type: "text", value: text.slice(sliceStart, sliceEnd) }],
             properties: {
-              style: `background: ${highlightBg(h.annotation_id)}; border-radius: 4px; padding: 0 2px; cursor: pointer;`,
+              style: [
+                `background: linear-gradient(transparent 55%, ${highlightBg(h.annotation_id)} 55%)`,
+                "border-radius: 3px",
+                "padding: 0 2px",
+                "cursor: pointer",
+                "box-decoration-break: clone",
+                "-webkit-box-decoration-break: clone",
+              ].join("; "),
               "data-annotation-id": String(h.annotation_id),
             },
           });
@@ -178,7 +151,7 @@ export default function ChatMessage({
         }
 
         const target = e.target as HTMLElement;
-        const highlightEl = target.closest
+        const highlightEl = target.closestt 
           ? (target.closest("[data-annotation-id]") as HTMLElement | null)
           : null;
 
@@ -254,7 +227,7 @@ export default function ChatMessage({
             ...(hasHighlights ? [rehypeHighlight] : []),
           ]}
         >
-          {normalizeMathContent(content)}
+          {content}
         </ReactMarkdown>
 
     </div>
